@@ -19,6 +19,14 @@ from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
 from dotenv import load_dotenv
 from openai import OpenAI
+import openai  # для openai.RateLimitError/APIStatusError/APIConnectionError в except-блоках
+# Прогрев ленивых субмодулей openai: при первом обращении из двух потоков одновременно
+# (паук + диагностика/эмбеддинги) возможен deadlock на _ModuleLock — импортируем заранее в главном потоке
+try:
+    import openai.resources.chat  # noqa: F401
+    import openai.resources.embeddings  # noqa: F401
+except Exception:
+    pass
 from datetime import datetime
 import json
 import customtkinter as ctk
@@ -74,6 +82,228 @@ wikipedia.set_lang("ru")  # Ищем на русском
 MASTER_KEY = base64.urlsafe_b64encode(b"SMK_Enterprise_Secret_Key_32byte")
 fernet = Fernet(MASTER_KEY)
 
+# ==================== СИСТЕМА ЛОГИРОВАНИЯ ====================
+
+import logging
+from logging.handlers import TimedRotatingFileHandler
+
+# Модульные логгеры: core (общее), graph (паук GraphRAG), llm (вызовы LLM),
+# sync (синхронизация БД), xwiki, audio, rag, ui
+log_core = logging.getLogger("core")
+log_graph = logging.getLogger("graph")
+log_llm = logging.getLogger("llm")
+log_sync = logging.getLogger("sync")
+log_xwiki = logging.getLogger("xwiki")
+log_audio = logging.getLogger("audio")
+log_rag = logging.getLogger("rag")
+log_ui = logging.getLogger("ui")
+
+def _mask_secrets(text):
+    """Маскирует API-ключи и Bearer-токены перед записью в лог (приватность 2.8)."""
+    s = str(text)
+    s = re.sub(r"sk-[\w\-]{8,}", "sk-***", s)
+    s = re.sub(r"(?i)bearer\s+\S+", "Bearer ***", s)
+    return s
+
+def get_log_dir():
+    """Папка логов внутри изолированного профиля пользователя (реплицируется вместе с профилем)."""
+    return os.path.join(get_local_path(), "logs")
+
+def get_log_file_path():
+    return os.path.join(get_log_dir(), "smk_agent.log")
+
+class _StreamToLogger:
+    """Обёртка потока: перенаправляет write() в логгер (перехват print() без переписывания кода)."""
+    MAX_LINE = 4000  # защита лога от гигантских print-выгрузок
+
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+
+    def write(self, message):
+        try:
+            msg = str(message).rstrip("\n")
+            if msg:
+                if len(msg) > self.MAX_LINE:
+                    msg = msg[:self.MAX_LINE] + f"… (обрезано, {len(msg)} симв.)"
+                self.logger.log(self.level, _mask_secrets(msg))
+        except Exception:
+            pass  # логирование не должно ронять печать
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+_REDIRECT_LOCK = threading.Lock()
+
+def _redirect_stdout_stderr():
+    """Перенаправляет sys.stdout/sys.stderr в логгер core. Молча пропускается,
+    если потоки отсутствуют (PyInstaller windowed: sys.stdout is None) или уже перенаправлены."""
+    with _REDIRECT_LOCK:
+        try:
+            if sys.stdout is not None and not isinstance(sys.stdout, _StreamToLogger):
+                sys.stdout = _StreamToLogger(log_core, logging.INFO)
+            if sys.stderr is not None and not isinstance(sys.stderr, _StreamToLogger):
+                sys.stderr = _StreamToLogger(log_core, logging.ERROR)
+        except Exception:
+            pass
+
+log_pyexec = logging.getLogger("pyexec")   # журнал исходов execute_python_code (логи ошибок — не тихие)
+
+_PYEXEC_LOCK = threading.Lock()
+
+class _ThreadRoutedStream:
+    """Прокси sys.stdout/stderr для in-process исполнения (execute_python_code).
+    Записи потока-исполнителя идут в буфер результата, записи остальных потоков —
+    в исходный stream (_StreamToLogger в dev). В exe sys.stdout is None — чужие
+    записи тихо отбрасываются (как нынешний print в exe), падения фоновых потоков нет."""
+    encoding = "utf-8"
+
+    def __init__(self, target, buf, owner_tid):
+        self._target = target
+        self._buf = buf
+        self._owner_tid = owner_tid
+
+    def write(self, s):
+        if threading.get_ident() == self._owner_tid:
+            return self._buf.write(s)
+        if self._target is not None:
+            return self._target.write(s)
+        return len(s) if s else 0
+
+    def flush(self):
+        for stream in (self._buf, self._target):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+def setup_logging():
+    """Инициализация файлового логирования + перехват print(). Вызывается ДО старта daemon-потоков.
+    Уровень берётся из local_settings['log_level'] (default INFO), формат: дата [уровень] [модуль] сообщение."""
+    try:
+        level_name = str(load_local_settings().get("log_level", "INFO")).upper()
+    except Exception:
+        level_name = "INFO"
+    level = getattr(logging, level_name, logging.INFO)
+    root = logging.getLogger()
+    root.setLevel(level)
+    if not any(isinstance(h, TimedRotatingFileHandler) for h in root.handlers):
+        try:
+            os.makedirs(get_log_dir(), exist_ok=True)
+            handler = TimedRotatingFileHandler(get_log_file_path(), when="midnight",
+                                               backupCount=7, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
+            root.addHandler(handler)
+        except Exception as e:
+            # Критический случай: логи недоступны — не роняем приложение
+            try:
+                logging.basicConfig(level=level)
+                log_core.error("Не удалось создать файловый логгер: %s", e)
+            except Exception:
+                pass
+    _redirect_stdout_stderr()
+
+def apply_log_level(level_name):
+    """Применяет уровень логирования без перезапуска (вызывается из настроек админа)."""
+    level = getattr(logging, str(level_name).upper(), logging.INFO)
+    logging.getLogger().setLevel(level)
+
+def _classify_net_error(exc):
+    """Классификация сетевых/API/БД ошибок для логов и диагностики.
+    Возвращает: PROXY_CONN / AUTH_401 / GEOBLOCK_403 / RATE_LIMIT_429 / SERVER_5XX /
+    HTTP_xxx / CONN / TIMEOUT / PARSE / DB / EMBED_DIM / UNKNOWN."""
+    try:
+        msg = str(exc or "").lower()
+    except Exception:
+        msg = ""
+    # БД и эмбеддинги — до сетевых классов
+    if isinstance(exc, sqlite3.Error):
+        return "DB"
+    if "dimension" in msg or ("embedding" in msg and ("shape" in msg or "mismatch" in msg)):
+        return "EMBED_DIM"
+    if isinstance(exc, json.JSONDecodeError):
+        return "PARSE"
+    # HTTP-код (openai.APIStatusError / requests.HTTPError)
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        code = int(code) if code is not None else None
+    except Exception:
+        code = None
+    if code is not None:
+        if code == 401: return "AUTH_401"
+        if code == 403: return "GEOBLOCK_403"
+        if code == 429: return "RATE_LIMIT_429"
+        if 500 <= code <= 599: return "SERVER_5XX"
+        return f"HTTP_{code}"
+    # Таймауты (openai.APITimeoutError — подкласс APIConnectionError, проверяем первым)
+    if isinstance(exc, (openai.APITimeoutError, requests.Timeout, httpx.TimeoutException, TimeoutError)):
+        return "TIMEOUT"
+
+    def _chain_has_proxy(e):
+        seen = 0
+        while e is not None and seen < 6:
+            try:
+                s = str(e).lower()
+            except Exception:
+                s = ""
+            if "proxy" in s or "socks" in s:
+                return True
+            e = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+            seen += 1
+        return False
+
+    if isinstance(exc, (openai.APIConnectionError, httpx.ConnectError,
+                        requests.exceptions.ConnectionError, ConnectionError)):
+        try:
+            proxy_on = _proxy_url_from_settings()
+        except Exception:
+            proxy_on = None
+        if proxy_on or _chain_has_proxy(exc):
+            return "PROXY_CONN"
+        return "CONN"
+    # Fallback по тексту ошибки (обёрнутые RuntimeError и т.п.)
+    if "timed out" in msg or "timeout" in msg:
+        return "TIMEOUT"
+    if "proxy" in msg or "socks" in msg:
+        return "PROXY_CONN"
+    if "403" in msg:
+        return "GEOBLOCK_403"
+    if "401" in msg:
+        return "AUTH_401"
+    if "429" in msg:
+        return "RATE_LIMIT_429"
+    return "UNKNOWN"
+
+def _write_json_cache(filename, payload):
+    """Атомарная запись JSON-кэша: сначала во временный файл, затем os.replace (целостность 2.8)."""
+    try:
+        path = os.path.join(get_local_path(), filename)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        log_core.warning("Не удалось записать кэш %s: %s", filename, e)
+
+def _read_json_cache(filename):
+    """Чтение JSON-кэша с fallback на None и WARNING в лог при повреждении."""
+    try:
+        path = os.path.join(get_local_path(), filename)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log_core.warning("Не удалось прочитать кэш %s: %s", filename, e)
+    return None
+
 def get_base_path():
     """Возвращает абсолютный путь к серверной папке. Поддерживает запуск с флагом --server"""
     import sys
@@ -109,8 +339,10 @@ def get_local_path():
     os.makedirs(app_dir, exist_ok=True)
     return app_dir
 
-def get_db_path():
-    """Теневая репликация: стягивает серверную БД на SSD пользователя для быстрой и безопасной работы"""
+def get_db_path(pull=True):
+    """Теневая репликация: стягивает серверную БД на SSD пользователя для быстрой и безопасной работы.
+    pull=False — только путь без репликации (диагностика/чтение): не трогаем живую локальную БД
+    из фоновых потоков (rmtree/copytree при открытых хэндлах Chroma повреждает БД на Windows)."""
     import shutil
     import chromadb.api.client
 
@@ -118,23 +350,24 @@ def get_db_path():
     local_db = os.path.join(get_local_path(), "local_vector_db")
 
     needs_pull = False
-    if os.path.exists(server_db):
-        server_sqlite = os.path.join(server_db, "chroma.sqlite3")
-        local_sqlite = os.path.join(local_db, "chroma.sqlite3")
-        if not os.path.exists(local_db) or not os.path.exists(local_sqlite):
-            needs_pull = True
-        elif os.path.getmtime(server_sqlite) > os.path.getmtime(local_sqlite):
-            needs_pull = True
+    if pull:
+        if os.path.exists(server_db):
+            server_sqlite = os.path.join(server_db, "chroma.sqlite3")
+            local_sqlite = os.path.join(local_db, "chroma.sqlite3")
+            if not os.path.exists(local_db) or not os.path.exists(local_sqlite):
+                needs_pull = True
+            elif os.path.getmtime(server_sqlite) > os.path.getmtime(local_sqlite):
+                needs_pull = True
 
-    if needs_pull:
-        # Принудительно освобождаем файлы БД перед перезаписью
-        try: chromadb.api.client.SharedSystemClient.clear_system_cache()
-        except: pass
-        try:
-            shutil.rmtree(local_db, ignore_errors=True)
-            shutil.copytree(server_db, local_db)
-        except Exception as e:
-            print(f"Ошибка репликации: {e}")
+        if needs_pull:
+            # Принудительно освобождаем файлы БД перед перезаписью
+            try: chromadb.api.client.SharedSystemClient.clear_system_cache()
+            except: pass
+            try:
+                shutil.rmtree(local_db, ignore_errors=True)
+                shutil.copytree(server_db, local_db)
+            except Exception as e:
+                log_sync.error("Ошибка репликации БД (теневое копирование): %s", e)
 
     os.makedirs(local_db, exist_ok=True)
     return local_db
@@ -146,6 +379,7 @@ def get_vault_data():
         "groq_key": "",
         "tavily_key": "",
         "admin_password": "admin",
+        "sync_password": "",
         "xwiki_login": "",
         "xwiki_password": "",
         "cohere_key": ""
@@ -165,6 +399,7 @@ def get_vault_data():
             "groq_key": str(data.get("groq_key", "")).strip(),
             "tavily_key": str(data.get("tavily_key", "")).strip(),
             "admin_password": str(data.get("admin_password", "admin")).strip() or "admin",
+            "sync_password": str(data.get("sync_password", "")).strip(),
             "xwiki_login": str(data.get("xwiki_login", "")).strip(),
             "xwiki_password": str(data.get("xwiki_password", "")).strip(),
             "cohere_key": str(data.get("cohere_key", "")).strip()
@@ -180,6 +415,7 @@ def save_vault_data(data):
             "groq_key": str(data.get("groq_key", "")).strip(),
             "tavily_key": str(data.get("tavily_key", "")).strip(),
             "admin_password": str(data.get("admin_password", "admin")).strip() or "admin",
+            "sync_password": str(data.get("sync_password", "")).strip(),
             "xwiki_login": str(data.get("xwiki_login", "")).strip(),
             "xwiki_password": str(data.get("xwiki_password", "")).strip(),
             "cohere_key": str(data.get("cohere_key", "")).strip()
@@ -272,9 +508,9 @@ def get_cloud_ef():
             _CLOUD_EF_CACHE["sig"] = sig
         return _CLOUD_EF_CACHE["ef"]
 
-def get_graph_db_path():
+def get_graph_db_path(pull=True):
     """Путь к sqlite графа связей — внутри локальной папки Chroma (реплицируется copytree)."""
-    return os.path.join(get_db_path(), "graph_rag.db")
+    return os.path.join(get_db_path(pull=pull), "graph_rag.db")
 
 def init_graph_db():
     """Создаёт graph_rag.db и таблицы: relations / processed_chunks / node_embeddings / cache_meta. Идемпотентна."""
@@ -283,7 +519,17 @@ def init_graph_db():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         conn = sqlite3.connect(path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("CREATE TABLE IF NOT EXISTS relations (id INTEGER PRIMARY KEY, source TEXT, relation TEXT, target TEXT, chunk_id TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS relations (id INTEGER PRIMARY KEY, source TEXT, relation TEXT, target TEXT, chunk_id TEXT, source_chunk TEXT)")
+        # Идемпотентная миграция старой базы: чанк-якорь рёбра (NULL = промах матчинга / GraphML).
+        # Отдельный try: гонка параллельных вызовов ALTER (нить паука + инструмент) не прерывает
+        # остальную инициализацию — при гонке колонку уже добавил другой вызов.
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(relations)")}
+            if "source_chunk" not in cols:
+                conn.execute("ALTER TABLE relations ADD COLUMN source_chunk TEXT")
+                log_graph.info("Миграция graph_rag.db: добавлена колонка relations.source_chunk (идемпотентно)")
+        except Exception as e:
+            log_graph.error("Миграция source_chunk не выполнена (%s): %s", _classify_net_error(e), e)
         conn.execute("CREATE TABLE IF NOT EXISTS processed_chunks (chunk_id TEXT PRIMARY KEY)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_source ON relations(source)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_target ON relations(target)")
@@ -296,7 +542,7 @@ def init_graph_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ne_canonical ON node_embeddings(canonical)")
         conn.commit(); conn.close()
     except Exception as e:
-        print(f"[init_graph_db] Ошибка: {e}")
+        log_graph.error("init_graph_db: ошибка (%s): %s", _classify_net_error(e), e)
 
 def _ensure_embedding_cache_fresh(conn, ef_model):
     """Сравнивает cache_meta.embedding_model с текущим; при несовпадении чистит node_embeddings
@@ -309,7 +555,7 @@ def _ensure_embedding_cache_fresh(conn, ef_model):
             conn.execute("INSERT OR REPLACE INTO cache_meta(key, value) VALUES ('embedding_model', ?)", (ef_model,))
             conn.commit()
     except Exception as e:
-        print(f"[_ensure_embedding_cache_fresh] Ошибка: {e}")
+        log_graph.error("_ensure_embedding_cache_fresh: ошибка (%s): %s", _classify_net_error(e), e)
 
 def _embed_canonical(canonical_map, conn, ef):
     """Батч-эмбеддинг канонических имён с кэшем в SQLite. Возвращает dict[norm_key -> np.float32 vector].
@@ -621,14 +867,14 @@ def sync_xwiki(app_instance=None):
         password = vault_data.get("xwiki_password", "")
 
         if not login or not password:
-            print("XWiki: логин или пароль не настроены")
+            log_xwiki.warning("XWiki: логин или пароль не настроены")
             return
 
         xwiki_urls = load_global_settings().get("xwiki_urls", [])
         xwiki_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync")
         
         if not xwiki_urls:
-            print("XWiki: нет ссылок для синхронизации. Очистка кэша...")
+            log_xwiki.info("XWiki: нет ссылок для синхронизации. Очистка кэша...")
             if os.path.exists(xwiki_dir):
                 for f in os.listdir(xwiki_dir):
                     if f.endswith(".md"):
@@ -677,7 +923,7 @@ def sync_xwiki(app_instance=None):
                 # Получаем HTML страницы
                 resp = session.get(url, timeout=60)
                 if resp.status_code != 200:
-                    print(f"XWiki: ошибка загрузки {url}: {resp.status_code}")
+                    log_xwiki.warning("XWiki: ошибка загрузки %s: HTTP %s", url, resp.status_code)
                     continue
 
                 soup = BeautifulSoup(resp.text, 'html.parser')
@@ -747,13 +993,13 @@ def sync_xwiki(app_instance=None):
                 all_fullnames.add(true_document)
                 crawl_tree(true_document)
 
-                print(f"XWiki: найдено {len(all_fullnames)} документов в {url}")
+                log_xwiki.info("XWiki: найдено %d документов в %s", len(all_fullnames), url)
 
             except Exception as e:
-                print(f"XWiki: ошибка JSTree discovery для {url}: {e}")
+                log_xwiki.error("XWiki: ошибка JSTree discovery для %s (%s): %s", url, _classify_net_error(e), e)
 
         if not all_fullnames:
-            print("XWiki: не найдено ни одного документа")
+            log_xwiki.warning("XWiki: не найдено ни одного документа")
             return
 
         # ШАГ 3: Формирование очереди скачивания (Queue)
@@ -780,9 +1026,9 @@ def sync_xwiki(app_instance=None):
 
                 queue_urls.append(unquote(p_url))
             except Exception as e:
-                print(f"XWiki: ошибка формирования URL для {fullname}: {e}")
+                log_xwiki.error("XWiki: ошибка формирования URL для %s: %s", fullname, e)
 
-        print(f"XWiki: всего в очереди {len(queue_urls)} страниц")
+        log_xwiki.info("XWiki: всего в очереди %d страниц", len(queue_urls))
 
         # ШАГ 4: Гибридный Паук и Vision Pipeline (Главный цикл)
         processed_count = 0
@@ -806,7 +1052,7 @@ def sync_xwiki(app_instance=None):
                 # Скачиваем страницу
                 resp = session.get(current_url, timeout=60)
                 if resp.status_code != 200:
-                    print(f"XWiki: Ошибка скачивания {current_url} (статус {resp.status_code})")
+                    log_xwiki.warning("XWiki: ошибка скачивания %s: HTTP %s", current_url, resp.status_code)
                     continue
 
                 soup = BeautifulSoup(resp.text, 'html.parser')
@@ -900,7 +1146,7 @@ def sync_xwiki(app_instance=None):
                                     with open(img_path, 'wb') as f:
                                         f.write(img_resp.content)
                             except Exception as e:
-                                print(f"XWiki: Ошибка скачивания картинки {src}: {e}")
+                                log_xwiki.warning("XWiki: ошибка скачивания картинки %s: %s", src, e)
                                 continue
 
                         # Вызов Vision только если картинка существует
@@ -911,7 +1157,7 @@ def sync_xwiki(app_instance=None):
                             img.replace_with(BeautifulSoup(
                                 f"\n\n> [!MEDIA] Иллюстрация из файла {img_name}:\n> {vision_text}\n\n", 'html.parser'))
                     except Exception as e:
-                        print(f"XWiki: ошибка Vision для {src}: {e}")
+                        log_xwiki.warning("XWiki: ошибка Vision для %s: %s", src, e)
 
                 # Обработка вложений XWiki (скачивание и подмена ссылок на якоря)
                 processed_html, current_page_attachments = process_xwiki_attachments(str(content_copy), current_url, session.auth, app_instance)
@@ -951,7 +1197,7 @@ def sync_xwiki(app_instance=None):
                 processed_count += 1
 
             except Exception as e:
-                print(f"XWiki: ошибка обработки {current_url}: {e}")
+                log_xwiki.error("XWiki: ошибка обработки %s (%s): %s", current_url, _classify_net_error(e), e)
                 # Сохраняем стейт даже при ошибке одного документа
                 continue
 
@@ -982,10 +1228,10 @@ def sync_xwiki(app_instance=None):
         with open(states_file, 'w', encoding='utf-8') as f:
             json.dump(states, f, ensure_ascii=False, indent=2)
 
-        print(f"XWiki: синхронизация завершена. Обработано {processed_count} документов.")
+        log_xwiki.info("XWiki: синхронизация завершена. Обработано %d документов.", processed_count)
 
     except Exception as e:
-        print(f"XWiki: критическая ошибка синхронизации: {e}")
+        log_xwiki.error("XWiki: критическая ошибка синхронизации (%s): %s", _classify_net_error(e), e)
 
 
 def update_xwiki_progress(app_instance, doc_name):
@@ -1805,7 +2051,7 @@ def sync_vector_db(self=None):
             try:
                 sync_xwiki(self)
             except Exception as e:
-                print(f"Ошибка синхронизации XWiki: {e}")
+                log_sync.error("Ошибка синхронизации XWiki (%s): %s", _classify_net_error(e), e)
         
         settings = load_global_settings()
         # пользовательские папки
@@ -1822,6 +2068,7 @@ def sync_vector_db(self=None):
             folders_to_scan.append(xwiki_dir)
         file_states = get_file_states()
         found_files = scan_folders_for_docs(folders_to_scan)
+        log_sync.info("Синхронизация БД: старт (файлов найдено: %d)", len(found_files))
         
         # ВОССТАНОВЛЕННЫЕ ПЕРЕМЕННЫЕ
         new_file_states = {}
@@ -1875,7 +2122,7 @@ def sync_vector_db(self=None):
                     gconn.executemany("DELETE FROM relations WHERE chunk_id = ?", [(c,) for c in to_del])
             gconn.commit(); gconn.close()
         except Exception as ge:
-            print(f"[sync_vector_db] Ошибка self-heal графа: {ge}")
+            log_sync.error("Ошибка self-heal графа: %s", ge)
         
         for i, (file_path, filename) in enumerate(files_to_reindex):
             if self is not None and len(files_to_reindex) > 0:
@@ -1888,7 +2135,7 @@ def sync_vector_db(self=None):
                 
                 # Логируем ошибку, чтобы она не была тихой
                 if isinstance(text, str) and text.startswith("Ошибка"):
-                    print(f"⚠️ [Индексатор] Пропущен файл {filename}. Причина: {text}")
+                    log_sync.warning("Индексатор: пропущен файл %s. Причина: %s", filename, text)
                     continue
 
                 display_source = filename
@@ -1929,7 +2176,7 @@ def sync_vector_db(self=None):
                         metadatas=batch_metas[j:j+batch_size]
                     )
             except Exception as e:
-                print(f"Ошибка индексации {filename}: {e}")
+                log_sync.error("Ошибка индексации файла %s (%s): %s", filename, _classify_net_error(e), e)
                 
         # Оповещение о нерасшифрованных аудио в чат
         if untranscribed_audio and self is not None:
@@ -1952,9 +2199,11 @@ def sync_vector_db(self=None):
                 client = chromadb.PersistentClient(path=local_db)
                 collection = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
             except Exception as e:
-                print(f"Ошибка выгрузки БД на сервер: {e}")
+                log_sync.error("Ошибка выгрузки БД на сервер: %s", e)
 
-        return collection, collection.count()
+        total_chunks = collection.count()
+        log_sync.info("Синхронизация БД: финиш (чанков: %d, файлов переиндексировано: %d)", total_chunks, len(files_to_reindex))
+        return collection, total_chunks
     finally:
         if self is not None:
             self._db_syncing = False
@@ -2099,27 +2348,37 @@ def _check_llm_connectivity(model=None):
     """Минимальный проксированный запрос к OpenRouter (1-токенный chat).
     Возвращает (ok, kind): kind in {'ok','403','429','conn','other'}.
     На старте паука и при подозрении на 403 — без тихого пустого цикла."""
+    t0 = time.time()
     try:
         client = get_llm_client()
         m = model or "openai/gpt-4o-mini"
         client.chat.completions.create(
             model=m, max_tokens=1, messages=[{"role": "user", "content": "."}], timeout=20)
+        log_llm.info("_check_llm_connectivity: ok (model=%s, %.2f с)", m, time.time() - t0)
         return True, "ok"
-    except openai.RateLimitError:
+    except openai.RateLimitError as e:
+        log_llm.warning("_check_llm_connectivity: RATE_LIMIT_429 (%.2f с): %s", time.time() - t0, _mask_secrets(e))
         return False, "429"
     except openai.APIStatusError as e:
         code = getattr(e, "status_code", None)
+        log_llm.warning("_check_llm_connectivity: %s, HTTP %s (%.2f с): %s",
+                        _classify_net_error(e), code, time.time() - t0, _mask_secrets(e))
         return False, ("403" if code == 403 else f"http_{code}")
-    except openai.APIConnectionError:
+    except openai.APIConnectionError as e:
+        log_llm.warning("_check_llm_connectivity: %s (%.2f с): %s", _classify_net_error(e), time.time() - t0, _mask_secrets(e))
         return False, "conn"
-    except Exception:
+    except Exception as e:
+        log_llm.warning("_check_llm_connectivity: UNKNOWN (%s): %s", time.time() - t0, _mask_secrets(e))
         return False, "other"
 
 _GRAPH_JSON_UNSUPPORTED = set()  # модели, не поддерживающие response_format json_object — пропускаем JSON-mode
 
-def _extract_graph_relations(text, model, cap=None, client=None):
+def _extract_graph_relations(text, model, cap=None, client=None, max_tokens=16000):
     """LLM-извлечение сущностей/связей.
-    Возвращает список [subj, pred, obj] (возможно пустой) либо None при parse-сбое (модель не выдала JSON).
+    Возвращает кортеж (rels, finish_reason, completion_tokens):
+      rels — список [subj, pred, obj] (возможно пустой) либо None при parse-сбое (модель не выдала JSON);
+      finish_reason — причина завершения ('length' = ответ обрезан по лимиту max_tokens);
+      completion_tokens — фактический расход выходных токенов (может быть None).
     API-сбои (403/429/conn) ПРОБРАСЫВАЮТСЯ как openai.APIStatusError/RateLimitError/APIConnectionError —
     паук маршрутизирует их (403 → пауза+диагностика, 429 → бэкофф с Retry-After)."""
     prompt = ('Извлеки сущности и связи из текста. Верни СТРОГО JSON без пояснений: '
@@ -2134,10 +2393,13 @@ def _extract_graph_relations(text, model, cap=None, client=None):
     # Task 6: пробуем JSON-mode; при неподдержке (400 BadRequestError и т.п.) — fallback на обычный вызов.
     # 403/429/conn пробрасываются наверх для маршрутизации пауком (пауза/бэкофф), fallback на них не делаем.
     def _call(with_json):
-        kw = {"model": model, "messages": msgs, "temperature": 0.2}
+        # max_tokens — страховка от runaway (зацикливание reasoning-модели): ограничивает ТОЛЬКО выход,
+        # полнота обхода окон от него не зависит (см. _graph_spider_loop)
+        kw = {"model": model, "messages": msgs, "temperature": 0.2, "max_tokens": int(max_tokens)}
         if with_json:
             kw["response_format"] = {"type": "json_object"}
         return llm.chat.completions.create(**kw)
+    t0 = time.time()
     try:
         resp = _call(model not in _GRAPH_JSON_UNSUPPORTED)
     except (openai.RateLimitError, openai.APIConnectionError):
@@ -2150,21 +2412,229 @@ def _extract_graph_relations(text, model, cap=None, client=None):
     except Exception:
         _GRAPH_JSON_UNSUPPORTED.add(model)
         resp = _call(False)  # fallback на прочих ошибках JSON-mode
+    usage = getattr(resp, "usage", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
     try:
-        raw = resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        raw = choice.message.content or ""
+        finish_reason = getattr(choice, "finish_reason", None)
     except Exception as e:
-        print(f"[_extract_graph_relations] Пустой/невалидный ответ: {e}")
-        return None
+        log_llm.error("_extract_graph_relations: пустой/невалидный ответ (PARSE): %s", e)
+        return None, None, completion_tokens
+    log_llm.info("_extract_graph_relations: model=%s, latency=%.2fs, status=ok, prompt_tokens=%s, completion_tokens=%s, finish_reason=%s",
+                 model, time.time() - t0,
+                 getattr(usage, "prompt_tokens", None), completion_tokens, finish_reason)
     parsed = _parse_graph_json(raw)
     if not parsed and ("{" not in raw or "}" not in raw):
         # Модель не выдала JSON-структуру — parse-сбой, повторим окно (poison-guard потом пропустит)
-        return None
-    return parsed
+        return None, finish_reason, completion_tokens
+    return parsed, finish_reason, completion_tokens
+
+# --- Точечный grounding рёбер графа: константы и матччер (общий для паука и поиска) ---
+GRAPH_GROUNDING_MAX_SQL_ROWS = 2000    # страховочный кап строк SQL (до группировки)
+GRAPH_GROUNDING_MAX_ROWS = 80          # максимум триплетов в выдаче (после группировки)
+GRAPH_GROUNDING_MAX_FILES_PER_TRIPLE = 4  # максимум файлов-источников на триплет в выдаче
+GRAPH_GROUNDING_SNIPPET_MAX = 600      # символов во фрагменте-подтверждении (чанк ~350 симв.)
+GRAPH_GROUNDING_MAX_SNIPPETS = 10      # максимум уникальных фрагментов (both+partial, после дедупа по чанку)
+
+_GRAPH_WORD_CHAR = re.compile(r"[0-9a-zA-Zа-яА-ЯёЁ]")  # буква/цифра — для границ слова
+
+def _entity_in_text(norm_entity, norm_text):
+    """Дословное вхождение нормализованной сущности в нормализованный текст.
+    Границы слова: соседний символ не буква и не цифра (иначе «ОТК» ложно матчится внутри «поток»)."""
+    if not norm_entity:
+        return False
+    pos = norm_text.find(norm_entity)
+    while pos != -1:
+        before = norm_text[pos - 1] if pos > 0 else ""
+        after = norm_text[pos + len(norm_entity)] if pos + len(norm_entity) < len(norm_text) else ""
+        if ((not before) or not _GRAPH_WORD_CHAR.match(before)) and \
+           ((not after) or not _GRAPH_WORD_CHAR.match(after)):
+            return True
+        pos = norm_text.find(norm_entity, pos + 1)
+    return False
+
+def _match_triplet_to_chunk(entities, chunk_texts):
+    """Детерминированный substring-матчинг триплета по чанкам. НИКАКОЙ LLM.
+
+    entities: список имён сущностей [субъект, объект] (оригиналы или норм-ключи — нормализация идемпотентна).
+    chunk_texts: список пар (chunk_id, text) в порядке чанков в файле.
+    Возвращает (chunk_id, level):
+      level='both'    — первый по порядку чанк, где найдены ВСЕ непустые уникальные сущности;
+      level='partial' — первый чанк, где найдена хотя бы одна (если 'both' нигде нет);
+      (None, None)    — сущности не найдены ни в одном чанке.
+    Нормализация _norm_entity с обеих сторон (lower + свёрнутые пробелы) — case-insensitive."""
+    uniq = {str(e).strip() for e in entities if e and str(e).strip()}
+    norms = {n for n in (_norm_entity(e) for e in uniq)}
+    norms.discard("")
+    if not norms or not chunk_texts:
+        return None, None
+    partial = None
+    for cid, text in chunk_texts:
+        if not text:
+            continue
+        nt = _norm_entity(text)
+        found = {n for n in norms if _entity_in_text(n, nt)}
+        if found == norms:
+            return cid, "both"
+        if found and partial is None:
+            partial = (cid, "partial")
+    return partial if partial else (None, None)
+
+def _make_graph_snippet(text, entities, max_chars=GRAPH_GROUNDING_SNIPPET_MAX):
+    """Фрагмент-подтверждение: короткий чанк целиком, иначе окно вокруг первого вхождения
+    первой найденной сущности (lower-find — только позиционирование для показа)."""
+    try:
+        s = (text or "").strip()
+        if not s:
+            return ""
+        if len(s) <= max_chars:
+            return s
+        pos = -1
+        for e in entities or []:
+            ne = _norm_entity(e)
+            if ne:
+                pos = s.lower().find(ne)
+                if pos != -1:
+                    break
+        start = max(0, (pos if pos > 0 else 0) - 100)
+        end = min(len(s), start + max_chars)
+        return ("…" if start > 0 else "") + s[start:end] + ("…" if end < len(s) else "")
+    except Exception:
+        return (text or "")[:max_chars] + "…"
+
+def _rebuild_window_chunk_ids(center_chunk_id, window_size):
+    """Восстанавливает id чанков окна арифметикой id: центр + (window_size-1) следующих того же файла.
+    Возвращает (file_path, [chunk_id, ...]) или (None, []), если id не в формате '{файл}_chunk_{N}'
+    (GraphML-рёбра: chunk_id = имя файла схемы)."""
+    m = re.match(r"^(.+)_chunk_(\d+)$", center_chunk_id or "")
+    if not m:
+        return None, []
+    fp, idx = m.group(1), int(m.group(2))
+    size = max(2, int(window_size or 6))
+    return fp, [f"{fp}_chunk_{k}" for k in range(idx, idx + size)]
+
+def _ground_graph_rows(rows, client, norm_to_orig):
+    """Точечный grounding: группировка рёбер по триплетам и файлам (ключ = file_path, НЕ отображаемое
+    имя: разные файлы могут иметь одинаковый basename), якорный чанк из source_chunk (уровень
+    пересчитывается на одном чанке) или восстановление окна (метод Б) для старых рёбер. Резка выдачи:
+    SQL-строки -> триплеты (MAX_ROWS) -> файлы на триплет (MAX_FILES_PER_TRIPLE); фрагменты
+    дедуплицируются по chunk_id. Никогда не бросает исключений. Уровни: both — обе сущности дословно;
+    partial — одна (фрагмент с пометкой «частичное подтверждение»); none — голый триплет; scheme — GraphML."""
+    try:
+        try:
+            window_size = int(load_global_settings().get("graph_rag_window", 6))
+        except Exception:
+            window_size = 6
+        # 1. Разбор: GraphML-рёбра (chunk_id без '_chunk_{N}') отделяются от рёбер паука
+        parsed, need_ids = [], set()
+        for (s, rel, t, cid, sc) in rows:
+            fp, win_ids = _rebuild_window_chunk_ids(cid, window_size)
+            parsed.append((s, rel, t, cid, sc, fp, win_ids))
+            if fp is None:
+                continue                    # GraphML: текстовых чанков нет
+            if sc:
+                need_ids.add(sc)             # якорь паука: достаточно одного чанка
+            else:
+                need_ids.update(win_ids)     # старое ребро: восстановленное окно (метод Б)
+        # 2. Один batch-get из smk_docs (локально, без эмбеддингов)
+        id2doc, id2src = {}, {}
+        if need_ids:
+            try:
+                docs_coll = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
+                recs = docs_coll.get(ids=sorted(need_ids), include=["documents", "metadatas"])
+                for i, d, m in zip(recs.get("ids", []), recs.get("documents", []),
+                                   recs.get("metadatas", []) or []):
+                    id2doc[i] = d or ""
+                    id2src[i] = (m or {}).get("source") or ""
+                missing = need_ids - set(id2doc)
+                if missing:
+                    miss_files = sorted({os.path.basename(str(x).rsplit("_chunk_", 1)[0]) for x in missing})
+                    log_graph.warning("GraphRAG grounding: %d чанков-источников не найдено в smk_docs "
+                                      "(файл пере-чанкован после пересинхронизации? файлы: %s) — рёбра выданы без фрагмента",
+                                      len(missing), ", ".join(miss_files[:5]))
+            except Exception as e:
+                log_graph.error("GraphRAG grounding: не удалось получить чанки из smk_docs (%s): %s",
+                                _classify_net_error(e), e)
+        # 3. Группировка: триплет -> файл (ключ = file_path) -> лучший уровень
+        def _rank(lvl):
+            return {"both": 2, "partial": 1}.get(lvl, 0)
+        groups = {}
+        for (s, rel, t, cid, sc, fp, win_ids) in parsed:
+            if fp is None:  # GraphML: chunk_id = имя файла схемы, матчинг не выполняется
+                groups.setdefault((s, rel, t), {})["scheme::" + cid] = \
+                    {"display": cid, "level": "scheme", "snippet": "", "chunk_id": None}
+                continue
+            g = groups.setdefault((s, rel, t), {})
+            entry = g.get(fp)
+            if entry is None:
+                display = (id2src.get(sc) if sc in id2src else None) or \
+                          next((id2src[i] for i in win_ids if i in id2src and id2src[i]), None) or \
+                          os.path.basename(fp)
+                entry = g[fp] = {"display": display, "level": "none", "snippet": "", "chunk_id": None}
+            mcid, lvl = None, None
+            if sc and sc in id2doc:
+                # паук записал якорь: проверяем уровень на самом чанке (дёшево, без LLM)
+                mcid, lvl = _match_triplet_to_chunk([s, t], [(sc, id2doc[sc])])
+            if not lvl:
+                # метод Б: восстановление окна + общий матччер (старые рёбра, NULL-якорь, протухший якорь)
+                mcid, lvl = _match_triplet_to_chunk([s, t], [(i, id2doc[i]) for i in win_ids if i in id2doc])
+            if lvl and _rank(lvl) > _rank(entry["level"]):
+                entry.update(level=lvl, chunk_id=mcid,
+                             snippet=id2doc.get(mcid, "") if mcid else "")
+        # 4. Форматирование трёхуровневой выдачи (резка: триплеты -> файлы -> фрагменты с дедупом по чанку)
+        lines, budget = [], GRAPH_GROUNDING_MAX_SNIPPETS
+        shown_snippets = set()   # chunk_id уже показанных фрагментов (одно окно -> много триплетов)
+        stat = {"both": 0, "partial": 0, "none": 0, "scheme": 0}
+        n_triplets = 0
+        for (s, rel, t), files in groups.items():
+            if n_triplets >= GRAPH_GROUNDING_MAX_ROWS:  # резка по триплетам, не по строкам
+                break
+            n_triplets += 1
+            lines.append(f"{norm_to_orig.get(s, s)} -> [{rel}] -> {norm_to_orig.get(t, t)}")
+            best = max((_rank(e["level"]) for e in files.values()), default=0)
+            stat["both" if best == 2 else "partial" if best == 1 else
+                  "scheme" if any(e["level"] == "scheme" for e in files.values()) else "none"] += 1
+            for shown, (fkey, entry) in enumerate(files.items()):
+                if shown >= GRAPH_GROUNDING_MAX_FILES_PER_TRIPLE:
+                    lines.append(f"  …и ещё {len(files) - shown} файл(ов)-источник(ов)")
+                    break
+                lvl_ok = entry["level"] in ("both", "partial")
+                if not lvl_ok:
+                    if entry["level"] == "scheme":
+                        lines.append(f"  [Из схемы: {entry['display']}] (ребро из блок-схемы, текстовый фрагмент отсутствует)")
+                    else:
+                        lines.append(f"  [Из файла: {entry['display']}] (дословный фрагмент не найден в чанках окна)")
+                elif not entry["snippet"] or budget <= 0:
+                    lines.append(f"  [Из файла: {entry['display']}] (фрагмент опущен — лимит выдачи)")
+                elif entry["chunk_id"] in shown_snippets:
+                    lines.append(f"  [Из файла: {entry['display']}] (фрагмент уже показан выше — тот же чанк)")
+                else:
+                    budget -= 1
+                    shown_snippets.add(entry["chunk_id"])
+                    mark = "" if entry["level"] == "both" else \
+                        " (частичное подтверждение: в чанке окна дословно найдена только одна сущность)"
+                    lines.append(f"  [Из файла: {entry['display']}]{mark} Фрагмент: «{_make_graph_snippet(entry['snippet'], [s, t])}»")
+        log_graph.debug("GraphRAG grounding: триплетов=%d, подтверждение: both=%d, partial=%d, none=%d, scheme=%d",
+                        stat["both"] + stat["partial"] + stat["none"] + stat["scheme"],
+                        stat["both"], stat["partial"], stat["none"], stat["scheme"])
+        return "\n".join(lines)
+    except Exception as e:
+        # Fallback на старый формат без привязки — инструмент не роняем никогда
+        log_graph.error("GraphRAG grounding: сбой (%s): %s — выданы голые триплеты", _classify_net_error(e), e)
+        seen, out = set(), []
+        for (s, rel, t, _cid, _sc) in rows:
+            if (s, rel, t) not in seen:
+                seen.add((s, rel, t))
+                out.append(f"{norm_to_orig.get(s, s)} -> [{rel}] -> {norm_to_orig.get(t, t)}")
+        return "\n".join(out) if out else "В графе связей не найдено."
 
 def query_knowledge_graph(query):
     """Инструмент агента: векторный поиск узлов + связи из sqlite. Формат 'Узел -> [связь] -> Узел'.
     Рёбра хранят нормализованный ключ (_norm_entity), узел document — оригинал; lower() в SQL даёт
-    backward-compat со старыми рёбрами (оригиналы другого регистра) и новыми нормализованными."""
+    backward-compat со старыми рёбрами (оригиналы другого регистра) и новыми нормализованными.
+    Каждый триплет выдаётся с файлами-источниками и дословным фрагментом-подтверждением
+    (лестница: обе сущности -> одна (пометка «частичное подтверждение») -> голый триплет)."""
     try:
         init_graph_db()
         client = chromadb.PersistentClient(path=get_db_path())
@@ -2185,12 +2655,15 @@ def query_knowledge_graph(query):
         conn = sqlite3.connect(get_graph_db_path(), timeout=30)
         ph = ",".join("?" * len(norms))
         rows = conn.execute(
-            f"SELECT DISTINCT source, relation, target FROM relations WHERE lower(source) IN ({ph}) OR lower(target) IN ({ph})",
+            f"SELECT DISTINCT source, relation, target, chunk_id, source_chunk FROM relations "
+            f"WHERE lower(source) IN ({ph}) OR lower(target) IN ({ph}) "
+            f"ORDER BY source, relation, target LIMIT {GRAPH_GROUNDING_MAX_SQL_ROWS}",
             (*norms, *norms)).fetchall()
         conn.close()
         if not rows:
             return "В графе связей не найдено."
-        return "\n".join(f"{norm_to_orig.get(r[0], r[0])} -> [{r[1]}] -> {norm_to_orig.get(r[2], r[2])}" for r in rows)
+        # Точечный grounding: файл-источник + дословный фрагмент (метод Б для старых рёбер)
+        return _ground_graph_rows(rows, client, norm_to_orig)
     except Exception as e:
         return f"Ошибка графа: {e}"
 
@@ -3236,6 +3709,8 @@ DEFAULT_LOCAL_SETTINGS = {
     "guest_model": "stepfun/step-3.5-flash:free",
     "admin_model": "openai/gpt-4o-mini",
     "model_history": [],
+    "manual_model_history": [],
+    "log_level": "INFO",
     "use_proxy": False,
     "proxy_host": "127.0.0.1",
     "proxy_port": "2080",
@@ -3417,6 +3892,8 @@ def format_xwiki_url_for_ui(raw_url):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
+        # Логирование настраивается ДО старта daemon-потоков (паук/синхронизация)
+        setup_logging()
         self.title(f"{APP_NAME} | Версия: {APP_VERSION}")
         self.geometry("900x650")
         self.grid_columnconfigure(1, weight=1)
@@ -3450,7 +3927,9 @@ class App(ctk.CTk):
         self.save_path_result = None
         self.save_path_queue = queue.Queue(maxsize=1)
         self.free_models_list = ["stepfun/step-3.5-flash:free", "google/gemini-2.0-flash-exp:free"]
+        self.top_models_list = []  # ТОП-10 популярных моделей (Data API rankings-daily)
         threading.Thread(target=self.fetch_free_models, daemon=True).start()
+        threading.Thread(target=self.fetch_top_models, daemon=True).start()
         
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
@@ -3477,10 +3956,6 @@ class App(ctk.CTk):
             hover_color="#1B5E20"
         )
         self.export_btn.grid(row=4, column=0, padx=20, pady=10)
-        
-        self.sync_button = ctk.CTkButton(self.sidebar_frame, text="Синхронизировать базу", command=self.manual_sync)
-        self.sync_button.grid(row=5, column=0, padx=20, pady=(10, 0), sticky="s")
-        self.btn_sync = self.sync_button
 
         self.auth_btn = ctk.CTkButton(
             self.sidebar_frame,
@@ -3489,7 +3964,7 @@ class App(ctk.CTk):
             fg_color="#455A64",
             hover_color="#263238"
         )
-        self.auth_btn.grid(row=6, column=0, padx=20, pady=(8, 0), sticky="s")
+        self.auth_btn.grid(row=5, column=0, padx=20, pady=(10, 0), sticky="s")
         
         # --- Тумблер автономного чтения ---
         def toggle_auto_read():
@@ -3503,7 +3978,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=toggle_auto_read
         )
-        self.auto_read_switch.grid(row=7, column=0, padx=20, pady=(15, 0), sticky="s")
+        self.auto_read_switch.grid(row=6, column=0, padx=20, pady=(15, 0), sticky="s")
         # ----------------------------------------
 
         # --- Тумблер глубокого аудита (Рефлексия) ---
@@ -3517,7 +3992,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=toggle_deep_audit
         )
-        self.deep_audit_switch.grid(row=8, column=0, padx=20, pady=(8, 0), sticky="s")
+        self.deep_audit_switch.grid(row=7, column=0, padx=20, pady=(8, 0), sticky="s")
         if self.current_settings.get("deep_audit_enabled", False):
             self.deep_audit_switch.select()
         else:
@@ -3532,18 +4007,18 @@ class App(ctk.CTk):
         self.update_ui_for_role()
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar_frame)
-        self.progress_bar.grid(row=9, column=0, padx=20, pady=(15, 4), sticky="ew")
+        self.progress_bar.grid(row=8, column=0, padx=20, pady=(15, 4), sticky="ew")
         self.progress_bar.set(0)
 
         self.file_progress_label = ctk.CTkLabel(self.sidebar_frame, text="Ожидание синхронизации", font=ctk.CTkFont(size=11))
-        self.file_progress_label.grid(row=10, column=0, padx=20, pady=(0, 6), sticky="w")
-        
+        self.file_progress_label.grid(row=9, column=0, padx=20, pady=(0, 6), sticky="w")
+
         self.status_label = ctk.CTkLabel(self.sidebar_frame, text="Загрузка...", font=ctk.CTkFont(size=12))
-        self.status_label.grid(row=11, column=0, padx=20, pady=(5, 15))
+        self.status_label.grid(row=10, column=0, padx=20, pady=(5, 15))
 
         # Индикатор прогресса построения графа связей (обновляется фоновым пауком)
         self.graph_status_label = ctk.CTkLabel(self.sidebar_frame, text="", font=ctk.CTkFont(size=11), text_color="#8ab4f8")
-        self.graph_status_label.grid(row=12, column=0, padx=20, pady=(0, 10), sticky="w")
+        self.graph_status_label.grid(row=11, column=0, padx=20, pady=(0, 10), sticky="w")
         
         self.chat_frame = ctk.CTkFrame(self)
         self.chat_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
@@ -3664,6 +4139,24 @@ class App(ctk.CTk):
         threading.Thread(target=init_db_thread, daemon=True).start()
         threading.Thread(target=self._graph_spider_loop, daemon=True).start()
 
+        # Лог старта приложения: роль, прокси (без паролей), выбранные модели
+        try:
+            _ls = self.current_settings
+            _proxy_info = "выключен"
+            if _ls.get("use_proxy", False):
+                _proxy_info = f"{_ls.get('proxy_host', '127.0.0.1')}:{_ls.get('proxy_port', '2080')}"
+            log_core.info("Старт приложения: версия=%s, роль=%s", APP_VERSION, self.current_role)
+            log_core.info("Прокси: use_proxy=%s (%s)", _ls.get("use_proxy", False), _proxy_info)
+            log_core.info("Модели: guest=%s, admin=%s, vision=%s, secretary=%s, embedding=%s, graph_rag=%s (enabled=%s)",
+                          _ls.get("guest_model", ""), _ls.get("admin_model", ""),
+                          self.global_settings.get("vision_model", ""),
+                          self.global_settings.get("secretary_model", ""),
+                          self.global_settings.get("embedding_model", ""),
+                          self.global_settings.get("graph_rag_model", ""),
+                          self.global_settings.get("graph_rag_enabled", False))
+        except Exception as e:
+            log_core.error("Ошибка лога старта приложения: %s", e)
+
     def _graph_spider_loop(self):
         """Фоновый daemon: извлекает сущности/связи из чанков smk_docs раундами с параллельным
         LLM-извлечением и сериализованной записью. Только у админа при graph_rag_enabled; пауза во время sync."""
@@ -3691,6 +4184,7 @@ class App(ctk.CTk):
                 delay = int(settings.get("graph_rag_delay", 60))
                 window_size = max(2, int(settings.get("graph_rag_window", 6)))
                 cap = int(settings.get("graph_rag_text_cap", 12000))
+                max_tokens = int(settings.get("graph_rag_max_tokens", 16000))  # страховка от runaway, не оптимизатор
                 workers = max(1, min(3, int(settings.get("graph_rag_workers", 2))))
                 max_fails = max(1, int(settings.get("graph_rag_max_fails", 5)))
                 model = settings.get("graph_rag_model", "deepseek/deepseek-v4-flash-0731")
@@ -3698,8 +4192,11 @@ class App(ctk.CTk):
 
                 # --- Фаза 0.3: проверка связности (старт + после 403) — без пустого цикла ---
                 if llm_unreachable:
+                    t_conn = time.time()
                     ok, kind = _check_llm_connectivity(model)
+                    conn_elapsed = time.time() - t_conn
                     if not ok:
+                        log_graph.info("Проверка связности LLM: недоступна (%s, %.2f с)", kind, conn_elapsed)
                         if kind == "403":
                             msg = "🚫 Граф: нет связи с OpenRouter (403) — проверьте прокси"
                         elif kind == "429":
@@ -3711,6 +4208,7 @@ class App(ctk.CTk):
                         self.after(0, lambda m=msg: self.graph_status_label.configure(text=m))
                         time.sleep(30); continue  # периодическая перепроверка, не пустой цикл
                     llm_unreachable = False  # связь восстановлена
+                    log_graph.info("Связность LLM восстановлена (%s, %.2f с)", kind, conn_elapsed)
 
                 init_graph_db()
                 # Кэшируем клиент + коллекции на self (создаются один раз, переиспользуются между раундами).
@@ -3798,49 +4296,67 @@ class App(ctk.CTk):
                 if not tasks:
                     time.sleep(delay); continue  # все окна тощие — прогресс сдвинулся
 
+                log_graph.debug("Раунд паука: кандидатов=%d, окон=%d, модель=%s, workers=%d, cap=%d",
+                                len(candidates), len(tasks), model, workers, cap)
+
                 # --- Параллельное LLM-извлечение (read-only API), общий проксированный клиент (Task 7) ---
                 shared_llm = get_llm_client()
-                results = {}  # center_id -> (relations|None, error_kind|None)
+                results = {}  # center_id -> (relations|None, finish_reason|None, completion_tokens|None, error_kind|None)
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    fut = {ex.submit(_extract_graph_relations, wt, model, cap, shared_llm): cid
+                    fut = {ex.submit(_extract_graph_relations, wt, model, cap, shared_llm, max_tokens): cid
                            for (cid, _win, wt) in tasks}
                     for f in as_completed(fut):
                         cid = fut[f]
                         try:
-                            results[cid] = (f.result(), None)
+                            rels_r, fin_r, comp_r = f.result()
+                            results[cid] = (rels_r, fin_r, comp_r, None)
                         except openai.RateLimitError as e:
-                            results[cid] = (None, "429")
-                            print(f"[GraphSpider] RateLimit (429) окна {cid}: {e}")
+                            results[cid] = (None, None, None, "429")
+                            log_graph.warning("Окно %s: RATE_LIMIT_429: %s", cid, _mask_secrets(e))
                         except openai.APIStatusError as e:
                             code = getattr(e, "status_code", None)
-                            results[cid] = (None, "403" if code == 403 else f"http_{code}")
-                            print(f"[GraphSpider] API {code} окна {cid}: {e}")
+                            results[cid] = (None, None, None, "403" if code == 403 else f"http_{code}")
+                            log_graph.warning("Окно %s: %s (HTTP %s): %s", cid, _classify_net_error(e), code, _mask_secrets(e))
                         except openai.APIConnectionError as e:
-                            results[cid] = (None, "conn")
-                            print(f"[GraphSpider] Connection окна {cid}: {e}")
+                            results[cid] = (None, None, None, "conn")
+                            log_graph.warning("Окно %s: %s: %s", cid, _classify_net_error(e), _mask_secrets(e))
                         except Exception as e:
-                            results[cid] = (None, "other")
-                            print(f"[GraphSpider] Ошибка окна {cid}: {e}")
+                            results[cid] = (None, None, None, "other")
+                            log_graph.error("Окно %s: UNKNOWN (%s): %s", cid, type(e).__name__, _mask_secrets(e))
 
                 # --- Сериализованная запись в ГЛАВНОМ потоке (единый писатель — безопасно для chroma/sqlite) ---
                 round_success = False
+                round_ok_count = 0
+                round_fail_count = 0
                 for (center_id, win, _wt) in tasks:
-                    rels, err = results.get(center_id, (None, None))
+                    rels, fin, comp, err = results.get(center_id, (None, None, None, None))
                     if err == "403":
                         llm_unreachable = True  # сигнал: пауза + диагностика в следующем проходе
                         continue  # чанки НЕ отмечаем
-                    if err is not None or rels is None:
+                    # parse-сбой: rels=None (нет JSON) ИЛИ обрезанный по лимиту ответ без триплетов (JSON не вышел целиком)
+                    parse_fail = err is None and (rels is None or (fin == "length" and not rels))
+                    if err is not None or parse_fail:
+                        round_fail_count += 1
                         # poison-guard: счётчик подряд неудач по center-чанку
                         fail_counts[center_id] = fail_counts.get(center_id, 0) + 1
+                        if parse_fail:
+                            log_graph.warning("Окно %s: PARSE_FAIL (модель не выдала JSON, попытка %d/%d, finish_reason=%s, completion_tokens=%s)",
+                                              center_id, fail_counts[center_id], max_fails, fin, comp)
                         if fail_counts[center_id] >= max_fails:
                             for cid in win:
                                 conn.execute("INSERT OR REPLACE INTO processed_chunks(chunk_id) VALUES (?)", (cid,))
-                            print(f"[GraphSpider] Poison-guard: пропуск чанка {center_id} после {max_fails} неудач подряд")
+                            log_graph.warning("Poison-guard: пропуск чанка %s после %d неудач подряд", center_id, max_fails)
                             fail_counts.pop(center_id, None)
                         continue
                     # успех — сброс счётчика этого чанка
                     fail_counts.pop(center_id, None)
                     round_success = True
+                    round_ok_count += 1
+                    if fin == "length":
+                        # ответ целиком или частично обрезан лимитом, но JSON успел выйти — при необходимости поднять graph_rag_max_tokens
+                        log_graph.warning("Окно %s: ответ обрезан по лимиту токенов (completion_tokens=%s, graph_rag_max_tokens=%d — при необходимости поднять), триплетов=%d",
+                                          center_id, comp, max_tokens, len(rels))
+                    log_graph.info("Окно %s: успех, триплетов=%d", center_id, len(rels))
                     # canonical + запись узлов/рёбер обёрнуты: при ошибке upsert (напр.
                     # dimension-mismatch после смены embedding-модели) чанки всё равно
                     # отмечаются обработанными — иначе бесконечный цикл с повторным LLM-извлечением.
@@ -3864,7 +4380,8 @@ class App(ctk.CTk):
                                     q = graph_coll.query(query_embeddings=vecs, n_results=1, include=["distances"])
                                     dists = q.get("distances", [])
                                 except Exception as e:
-                                    print(f"[GraphSpider] Ошибка дедуп-запроса: {e}")
+                                    log_graph.error("Ошибка дедуп-запроса (chunk_id=%s, класс=%s): %s",
+                                                    center_id, _classify_net_error(e), e)
                                     dists = []
                                 for i, (k, d) in enumerate(zip(keys, docs_c)):
                                     d_row = dists[i] if i < len(dists) else []
@@ -3876,19 +4393,41 @@ class App(ctk.CTk):
                                     new_metas.append({"entity": d})
                                 if new_ids:
                                     graph_coll.upsert(ids=new_ids, embeddings=new_vecs, documents=new_docs, metadatas=new_metas)
-                        # запись рёбер (source/target = нормализованный ключ, тегируем центральным chunk_id)
+                        # запись рёбер (source/target = нормализованный ключ, тегируем центральным chunk_id);
+                        # source_chunk = чанк-якорь из substring-матчинга окна (метод В, 0 LLM-вызовов):
+                        # пишется при любом матче (both/partial), уровень пересчитывается при выдаче по одному чанку
+                        window_chunks = [(cid, id2doc[cid]) for cid in sorted(win, key=_idx_of)
+                                         if cid in id2doc and id2doc[cid]]
+                        m_exact = m_partial = m_miss = 0
                         for subj, pred, obj in rels:
                             s = _norm_entity(subj)
                             t = _norm_entity(obj)
                             if s and t:
-                                conn.execute("INSERT INTO relations(source, relation, target, chunk_id) VALUES (?,?,?,?)",
-                                             (s, pred, t, center_id))
+                                src_chunk = None
+                                try:
+                                    mcid, lvl = _match_triplet_to_chunk([subj, obj], window_chunks)
+                                    if lvl == "both":
+                                        src_chunk = mcid; m_exact += 1
+                                    elif lvl == "partial":
+                                        src_chunk = mcid; m_partial += 1
+                                    else:
+                                        m_miss += 1
+                                except Exception as m_err:
+                                    m_miss += 1
+                                    log_graph.warning("Матчинг триплета окна %s не удался (%s): «%s» -[%s]-> «%s» — ребро без source_chunk",
+                                                      center_id, _classify_net_error(m_err), subj, pred, obj)
+                                conn.execute("INSERT INTO relations(source, relation, target, chunk_id, source_chunk) VALUES (?,?,?,?,?)",
+                                             (s, pred, t, center_id, src_chunk))
+                        if rels:
+                            log_graph.info("Окно %s: матчинг рёбер: точных=%d, частичных=%d, промахов=%d",
+                                           center_id, m_exact, m_partial, m_miss)
                     except Exception as write_err:
                         msg = str(write_err).lower()
                         if "dimension" in msg or "shape" in msg or "embedding" in msg:
-                            print(f"[GraphSpider] Размерность векторов не совпадает (сменилась embedding-модель?) — окно {center_id} пропущено, переиндексируйте граф. ({write_err})")
+                            log_graph.error("Размерность векторов не совпадает (EMBED_DIM, сменилась embedding-модель?) — окно %s пропущено, переиндексируйте граф: %s",
+                                            center_id, write_err)
                         else:
-                            print(f"[GraphSpider] Ошибка записи окна {center_id}: {write_err}")
+                            log_graph.error("Ошибка записи окна %s (класс=%s): %s", center_id, _classify_net_error(write_err), write_err)
                     # отмечаем обработанными все чанки окна (всегда — иначе бесконечный цикл)
                     for cid in win:
                         conn.execute("INSERT OR REPLACE INTO processed_chunks(chunk_id) VALUES (?)", (cid,))
@@ -3905,9 +4444,10 @@ class App(ctk.CTk):
                     sleep_time = min(delay * (2 ** consecutive_fail_rounds), 300)  # макс 5 мин
                 else:
                     sleep_time = delay  # успех — задержка в конце раунда
+                log_graph.info("Итог раунда: успехов=%d, неудач=%d, sleep=%d c", round_ok_count, round_fail_count, sleep_time)
                 time.sleep(sleep_time)
-            except Exception as e:
-                print(f"[GraphSpider] Ошибка итерации: {e}")
+            except Exception:
+                log_graph.exception("Ошибка итерации паука")
                 try: time.sleep(5)
                 except Exception: pass
             finally:
@@ -3916,24 +4456,138 @@ class App(ctk.CTk):
                     except Exception: pass
 
     def fetch_free_models(self):
+        """Загружает список бесплатных ТЕКСТОВЫХ чат-моделей OpenRouter (с прокси и ключом —
+        иначе геоблок РФ даёт 403 и список навсегда остаётся дефолтным).
+        Кэш free_models_cache.json в профиле; при сбое сети — чтение последнего кэша."""
+        log_core.info("Загрузка списка бесплатных моделей...")
         try:
-            response = requests.get("https://openrouter.ai/api/v1/models", timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            api_key = get_vault_data().get("openrouter_key", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+            headers = {"Accept": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            proxy_url = _proxy_url_from_settings()
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            resp = requests.get("https://openrouter.ai/api/v1/models", headers=headers, proxies=proxies, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
             models = data.get("data", []) if isinstance(data, dict) else []
 
             free_models = []
             for model in models:
-                pricing = model.get("pricing", {}) if isinstance(model, dict) else {}
-                if str(pricing.get("prompt", "")).strip() == "0" and str(pricing.get("completion", "")).strip() == "0":
-                    model_id = model.get("id")
-                    if model_id:
-                        free_models.append(model_id)
+                if not isinstance(model, dict):
+                    continue
+                pricing = model.get("pricing", {}) or {}
+                if str(pricing.get("prompt", "")).strip() != "0" or str(pricing.get("completion", "")).strip() != "0":
+                    continue
+                # Только текстовый вывод: modality оканчивается на '->text', либо output-модальность содержит 'text'
+                arch = model.get("architecture", {}) or {}
+                modality = str(arch.get("modality", "")).lower()
+                output_mods = [str(x).lower() for x in (arch.get("output_modalities") or [])]
+                if not (modality.endswith("->text") or "text" in output_mods):
+                    continue
+                model_id = model.get("id")
+                if model_id:
+                    free_models.append(model_id)
 
-            if free_models:
-                self.free_models_list = sorted(set(free_models))
-        except Exception:
-            pass
+            if not free_models:
+                raise ValueError("API вернул пустой список бесплатных моделей")
+            self.free_models_list = sorted(set(free_models))
+            _write_json_cache("free_models_cache.json",
+                              {"fetched_at": datetime.now().isoformat(), "models": self.free_models_list})
+            log_core.info("Бесплатные модели: загружено %d позиций", len(self.free_models_list))
+        except Exception as e:
+            log_core.warning("Загрузка бесплатных моделей не удалась (%s): %s — использую кэш/дефолт",
+                             _classify_net_error(e), e)
+            cached = _read_json_cache("free_models_cache.json")
+            models = cached.get("models") if isinstance(cached, dict) else None
+            if models:
+                self.free_models_list = sorted(set(models))
+                log_core.info("Бесплатные модели: взяты из кэша (%d позиций, от %s)",
+                              len(self.free_models_list), cached.get("fetched_at", "?"))
+
+    def fetch_top_models(self):
+        """ТОП-10 популярных моделей за сутки (OpenRouter Data API: /api/v1/datasets/rankings-daily).
+        Кэш top_models_cache.json обновляется не чаще раза в сутки; при сбое — последний кэш,
+        затем model_history. Результат: self.top_models_list."""
+        try:
+            cached = _read_json_cache("top_models_cache.json")
+            today = datetime.now().strftime("%Y-%m-%d")
+            if isinstance(cached, dict) and cached.get("fetched_date") == today and cached.get("models"):
+                self.top_models_list = list(cached["models"])[:10]
+                return
+
+            api_key = get_vault_data().get("openrouter_key", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+            if not api_key:
+                log_core.warning("ТОП-10 моделей: ключ OpenRouter не задан (AUTH_401) — fallback")
+                self._fallback_top_models()
+                return
+            proxy_url = _proxy_url_from_settings()
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+            resp = requests.get("https://openrouter.ai/api/v1/datasets/rankings-daily",
+                                headers=headers, proxies=proxies, timeout=15)
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+
+            # Группируем по дате, берём последнюю; сортировка по total_tokens desc (приходит строкой)
+            by_date = {}
+            for row in data:
+                if isinstance(row, dict):
+                    by_date.setdefault(str(row.get("date", ""))[:10], []).append(row)
+            if not by_date:
+                raise ValueError("Пустой ответ rankings-daily")
+            last_date = max(by_date.keys())
+
+            def _tokens(row):
+                try:
+                    return int(str(row.get("total_tokens", "0") or 0))
+                except Exception:
+                    return 0
+
+            rows = [r for r in by_date[last_date]
+                    if str(r.get("model_permaslug", "") or "").strip() not in ("", "other")]
+            rows.sort(key=_tokens, reverse=True)
+            slugs = []
+            for r in rows:
+                s = str(r.get("model_permaslug", "")).strip()
+                if s and s != "other" and s not in slugs:
+                    slugs.append(s)
+                if len(slugs) >= 10:
+                    break
+
+            # Пересечение с каталогом /api/v1/models — защита от «фантомов» (несуществующих ID)
+            valid_ids = set()
+            try:
+                resp2 = requests.get("https://openrouter.ai/api/v1/models", headers=headers, proxies=proxies, timeout=15)
+                if resp2.status_code == 200:
+                    valid_ids = {m.get("id") for m in resp2.json().get("data", []) if isinstance(m, dict) and m.get("id")}
+            except Exception as e:
+                log_core.warning("ТОП-10: каталог /api/v1/models недоступен (%s) — валидация ID пропущена",
+                                 _classify_net_error(e))
+            if valid_ids:
+                checked = [s for s in slugs if s in valid_ids]
+                if checked:
+                    slugs = checked
+            if not slugs:
+                raise ValueError("Не удалось собрать ТОП-10 после валидации")
+            self.top_models_list = slugs[:10]
+            _write_json_cache("top_models_cache.json",
+                              {"fetched_date": last_date, "models": self.top_models_list})
+            log_core.info("ТОП-10 моделей за %s: %s", last_date, ", ".join(self.top_models_list))
+        except Exception as e:
+            log_core.warning("ТОП-10 моделей: сбой загрузки (%s): %s — fallback на кэш/историю",
+                             _classify_net_error(e), e)
+            self._fallback_top_models()
+
+    def _fallback_top_models(self):
+        """Fallback ТОП-10: последний кэш, затем model_history (без краша офлайн-запуска)."""
+        cached = _read_json_cache("top_models_cache.json")
+        if isinstance(cached, dict) and cached.get("models"):
+            self.top_models_list = list(cached["models"])[:10]
+            log_core.info("ТОП-10 моделей: взяты из кэша (от %s)", cached.get("fetched_date", "?"))
+        else:
+            self.top_models_list = list(self.current_settings.get("model_history", []))[:10]
+            log_core.info("ТОП-10 моделей: fallback на model_history (%d позиций)", len(self.top_models_list))
 
     # ==================== ПРОМПТ-МАСТЕР ====================
 
@@ -4216,8 +4870,6 @@ class App(ctk.CTk):
 
     def update_ui_for_role(self):
         is_admin = self.current_role == "admin"
-        if hasattr(self, "btn_sync"):
-            self.btn_sync.configure(state="normal" if is_admin else "disabled")
         if hasattr(self, "btn_history"):
             if is_admin:
                 self.btn_history.grid()
@@ -4300,38 +4952,82 @@ class App(ctk.CTk):
             "os.rmdir", "ctypes", "__import__", "eval(", "exec(", "import socket", "import urllib",
             "import requests", "import http.client", "import httpx", "import webbrowser",
             "os.exec", "os.spawn", "os.kill", "signal.signal", "importlib", "pickle",
+            # In-process усиление: код живёт в нашем процессе.
+            # environ/getenv — утечка API-ключей в чат (subprocess-версия фильтровала окружение);
+            # os._exit/os.abort — убили бы всё приложение (в subprocess погибал только ребёнок);
+            # chromadb/openai — доступ к векторной БД и LLM-клиенту из анализа Excel не нужен;
+            # from-варианты — закрытие обходов substring-фильтра.
+            "environ", "getenv", "input(", "os._exit", "os.abort", "chromadb", "openai",
+            "quit(", "exit(",
+            "from os import", "from subprocess import", "from urllib", "from importlib",
+            "from socket", "from http", "from webbrowser", "from builtins", "from signal",
+            # In-process: закрытие прямых маршрутов к host-namespace через sys.modules['__main__']
+            # (иначе одной строкой без обфускации: import sys; sys.modules['__main__'].get_vault_data()
+            # эксфильтрует секреты vault в чат). sys/gc/inspect — доступ к фреймам и модулям хоста;
+            # builtins/__builtins__ — обход через объект builtins; __main__ — namespace нашего модуля.
+            "import sys", "from sys", "import gc", "from gc", "import inspect", "from inspect",
+            "import builtins", "__main__", "__builtins__",
         ]
         try:
-            if any(p in (code or "").lower() for p in _deny):
+            matched_deny = next((p for p in _deny if p in (code or "").lower()), None)
+            if matched_deny:
+                log_pyexec.warning("Код отклонён deny-листом (шаблон «%s»): %s",
+                                   matched_deny, _mask_secrets((code or "")[:200]))
                 return ("Код отклонён из соображений безопасности: обнаружен запрещённый шаблон. "
                         "Используйте только pandas/openpyxl для анализа Excel, без обращения к сети "
                         "и файловой системе вне чтения переданного файла.")
-            work_dir = tempfile.mkdtemp(prefix="smk_exec_")
-            temp_script = None
-            try:
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
-                    f.write(code)
-                    temp_script = f.name
-                # Минимальное окружение: белый список безопасных переменных, без ключей/прокси/секретов
-                _safe_whitelist = {
-                    "PATH", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
-                    "COMSPEC", "PATHEXT", "PYTHONIOENCODING", "LANG", "LC_ALL",
-                }
-                safe_env = {k: v for k, v in os.environ.items() if k in _safe_whitelist}
-                result = subprocess.run([sys.executable, temp_script], capture_output=True, text=True,
-                                        timeout=30, env=safe_env, cwd=work_dir)
-            finally:
-                if temp_script:
-                    try:
-                        os.unlink(temp_script)
-                    except Exception:
-                        pass
-                shutil.rmtree(work_dir, ignore_errors=True)
-            if result.returncode == 0:
-                return result.stdout if result.stdout else "Код выполнен успешно (без вывода)"
-            return f"ОШИБКА:\n{result.stderr}"
-        except subprocess.TimeoutExpired:
-            return "ОШИБКА: Превышено время выполнения кода (30 секунд)"
+            # In-process исполнение вместо subprocess: в exe-сборке sys.executable — это SMK_Agent.exe,
+            # а не python.exe, поэтому subprocess запускал копию агента (новое окно) и падал по таймауту.
+            # Код исполняется в daemon-потоке с перехватом stdout/stderr и лимитом 30 секунд.
+            # Потокобезопасно: метод вызывается из agent_loop в daemon-потоке, GUI не блокируется.
+            import io
+            import builtins
+            buf = io.StringIO()
+            done = threading.Event()
+            outcome = {}
+
+            def _run_generated():
+                # Прокси ставит сам поток-исполнитель (ident известен только внутри потока;
+                # до worker.start() worker.ident == None — снаружи прокси не создать корректно).
+                # Снимает прокси родитель в finally после wait/таймаута.
+                old_out, old_err = sys.stdout, sys.stderr
+                sys.stdout = _ThreadRoutedStream(old_out, buf, threading.get_ident())
+                sys.stderr = _ThreadRoutedStream(old_err, buf, threading.get_ident())
+                try:
+                    exec(compile(code, "<excel_code>", "exec"),
+                         {"__name__": "__main__", "__builtins__": builtins})
+                    outcome["ok"] = True
+                except Exception as run_err:
+                    outcome["err"] = f"{type(run_err).__name__}: {run_err}"
+                finally:
+                    done.set()
+
+            # Сериализация: параллельные вызовы (нет busy-guard у send_message) не должны
+            # драться за подмену sys.stdout; лимит 30 с у ожидающего стартует после захвата лока
+            with _PYEXEC_LOCK:
+                old_out, old_err = sys.stdout, sys.stderr
+                worker = threading.Thread(target=_run_generated, daemon=True)
+                try:
+                    worker.start()
+                    if not done.wait(timeout=30):
+                        log_pyexec.warning("Таймаут 30 с (код: %s)", _mask_secrets((code or "")[:200]))
+                        return ("ОШИБКА: Превышено время выполнения кода (30 секунд). "
+                                "Код не завершился: проверьте путь к файлу (файл вложения уже локален) "
+                                "и упростите обработку (читайте только нужные листы/колонки).")
+                finally:
+                    sys.stdout, sys.stderr = old_out, old_err
+            if "err" in outcome:
+                log_pyexec.error("Ошибка исполнения (%s): %s",
+                                 outcome["err"][:200], _mask_secrets((code or "")[:200]))
+                err_out = buf.getvalue().strip()
+                if len(err_out) > 5000:
+                    err_out = err_out[:5000] + "\n... (вывод обрезан)"
+                return f"ОШИБКА:\n{outcome['err']}" + (f"\n{err_out}" if err_out else "")
+            out = buf.getvalue()
+            if len(out) > 20000:
+                out = out[:20000] + "\n... (вывод обрезан: показаны первые 20000 символов)"
+            log_pyexec.info("Успешное исполнение (вывод %d симв.)", len(out))
+            return out if out else "Код выполнен успешно (без вывода)"
         except Exception as e:
             return f"ОШИБКА: {str(e)}"
 
@@ -4401,6 +5097,7 @@ class App(ctk.CTk):
 
     def _real_transcribe_api(self, filepath):
         """Отправка аудиофайла на транскрибацию через выбранный провайдер."""
+        t0 = time.time()
         try:
             provider = self.global_settings.get("audio_provider", "OpenRouter")
             model = self.global_settings.get("audio_model", "openai/gpt-4o-audio-preview")
@@ -4503,9 +5200,14 @@ class App(ctk.CTk):
                         return
 
                 if result is not None:
+                    log_audio.info("Транскрибация: provider=%s, model=%s, latency=%.2fs, status=ok, символов=%d",
+                                   provider, model, time.time() - t0, len(result))
                     self.after(0, self._insert_transcript, result)
 
         except Exception as e:
+            log_audio.error("Транскрибация: сбой (%s), provider=%s, model=%s: %s",
+                            _classify_net_error(e), self.global_settings.get("audio_provider", ""),
+                            self.global_settings.get("audio_model", ""), e)
             self.after(0, self.append_to_chat, f"\n⚠️ Ошибка аудио: {e}\n")
         finally:
             try:
@@ -5391,6 +6093,7 @@ class App(ctk.CTk):
                 "Верни СТРОГО JSON: {\"is_new_fact\": true/false, \"fact_text\": \"Полный текст для базы\", \"summary\": \"Краткая суть для лога в чат\"}."
             )
             
+            t0 = time.time()
             response = get_llm_client().chat.completions.create(
                 model=self.global_settings.get("secretary_model", "stepfun/step-3.5-flash:free"),
                 messages=[
@@ -5399,9 +6102,14 @@ class App(ctk.CTk):
                 ],
                 response_format={"type": "json_object"}
             )
-            
+            usage = getattr(response, "usage", None)
+            log_llm.info("Фоновый секретарь: model=%s, latency=%.2fs, status=ok, prompt_tokens=%s, completion_tokens=%s",
+                         self.global_settings.get("secretary_model", ""),
+                         time.time() - t0,
+                         getattr(usage, "prompt_tokens", None), getattr(usage, "completion_tokens", None))
+
             result = json.loads(response.choices[0].message.content)
-            
+
             if result.get("is_new_fact", False):
                 fact_text = result.get("fact_text", "")
                 summary = result.get("summary", "")
@@ -5409,9 +6117,9 @@ class App(ctk.CTk):
                     memorize_important_fact(fact_text)
                     msg = f"\n[🤫 Фоновый Секретарь: Запомнил новый факт СМК - {summary}]\n\n"
                     self.after(0, lambda: self.append_to_chat(msg))
-        except Exception:
-            # Отказоустойчивость: silently fail
-            pass
+        except Exception as e:
+            # Отказоустойчивость: тихий сбой, но со следом в логе
+            log_llm.warning("Фоновый секретарь: сбой (%s): %s", _classify_net_error(e), _mask_secrets(e))
 
     def clear_chat(self):
         self.chat_textbox.configure(state="normal")
@@ -5589,9 +6297,15 @@ class App(ctk.CTk):
             print(f"Ошибка экспорта в Word: {e}")
             self.append_to_chat(f"\n[⚠️ Система: Ошибка при экспорте диалога в Word: {e}]\n\n", "system")
 
-    def manual_sync(self):
+    def manual_sync(self, sync_btn=None):
+        """Ручная синхронизация базы. sync_btn — локальная ссылка на кнопку текущего окна настроек
+        (атрибута главного окна больше нет); guard по winfo_exists на случай закрытия окна настроек."""
         self.status_label.configure(text="Синхронизация...")
-        self.sync_button.configure(state="disabled")
+        if sync_btn is not None:
+            try:
+                sync_btn.configure(state="disabled")
+            except Exception:
+                pass
         def do_sync():
             try:
                 _, count = sync_vector_db(self)
@@ -5601,7 +6315,13 @@ class App(ctk.CTk):
                 self.after(0, lambda msg=error_msg: self.status_label.configure(text=msg))
                 print(f"Sync error: {error_msg}")
             finally:
-                self.after(0, lambda: self.sync_button.configure(state="normal"))
+                def _restore_btn():
+                    try:
+                        if sync_btn is not None and sync_btn.winfo_exists():
+                            sync_btn.configure(state="normal")
+                    except Exception:
+                        pass
+                self.after(0, _restore_btn)
         threading.Thread(target=do_sync, daemon=True).start()
 
     def open_settings(self):
@@ -5759,7 +6479,9 @@ class App(ctk.CTk):
 
             ctk.CTkLabel(tab_graph, text="Модель извлечения сущностей (бесплатная):").pack(pady=(10, 0))
             self.graph_rag_model_var = ctk.StringVar(value=self.global_settings.get("graph_rag_model", "deepseek/deepseek-v4-flash-0731"))
-            ctk.CTkComboBox(tab_graph, variable=self.graph_rag_model_var, values=self.free_models_list, width=300).pack(pady=5)
+            # Ссылка на self — для фонового обновления списка бесплатных моделей без переоткрытия окна
+            self.graph_rag_model_combo = ctk.CTkComboBox(tab_graph, variable=self.graph_rag_model_var, values=self.free_models_list, width=300)
+            self.graph_rag_model_combo.pack(pady=5)
 
             ctk.CTkLabel(tab_graph, text="Задержка Паука (сек между итерациями):", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 0))
             self.graph_rag_delay_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_delay", 60)))
@@ -5777,6 +6499,15 @@ class App(ctk.CTk):
             graph_window_label = ctk.CTkLabel(tab_graph, text=f"{int(self.graph_rag_window_var.get())} чанков")
             graph_window_label.pack(pady=(0, 5))
             graph_window_slider.configure(command=lambda v: graph_window_label.configure(text=f"{int(v)} чанков"))
+
+            # Лимит выходных токенов (страховка от зацикливания reasoning-моделей; не оптимизатор токенов)
+            ctk.CTkLabel(tab_graph, text="Лимит выходных токенов (страховка от зацикливания):").pack(pady=(10, 0))
+            self.graph_rag_max_tokens_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_max_tokens", 16000)))
+            graph_tokens_slider = ctk.CTkSlider(tab_graph, from_=1000, to=32000, number_of_steps=310, variable=self.graph_rag_max_tokens_var, width=300)
+            graph_tokens_slider.pack(pady=(5, 0))
+            graph_tokens_label = ctk.CTkLabel(tab_graph, text=f"{int(self.graph_rag_max_tokens_var.get())} токенов")
+            graph_tokens_label.pack(pady=(0, 5))
+            graph_tokens_slider.configure(command=lambda v: graph_tokens_label.configure(text=f"{int(v)} токенов"))
 
             # Cap текста в окне (символов)
             ctk.CTkLabel(tab_graph, text="Cap текста в окне (2000-30000 симв.):").pack(pady=(10, 0))
@@ -5807,17 +6538,77 @@ class App(ctk.CTk):
 
         # --- ВКЛАДКА 1: МОДЕЛИ ---
         ctk.CTkLabel(tab_models, text="ID Модели (OpenRouter):").pack(pady=(10, 0))
-        
+
+        # Валидация гостевой модели: если сохранённой нет в свежем списке бесплатных — сброс на первую
+        if not is_admin:
+            saved_guest_model = self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free")
+            if saved_guest_model and saved_guest_model not in self.free_models_list and self.free_models_list:
+                log_core.warning("Гостевая модель '%s' отсутствует в списке бесплатных — сброс на '%s'",
+                                 saved_guest_model, self.free_models_list[0])
+                self.current_settings["guest_model"] = self.free_models_list[0]
+
         if is_admin:
-            # АДМИН: Редактируемый список с историей Топ-10
-            history = self.current_settings.get("model_history", [])
-            model_entry = ctk.CTkComboBox(tab_models, width=450, values=history)
+            # АДМИН: ручной ввод + список (5 ручных + ТОП-10 популярных, дедупликация)
+            manual_history = self.current_settings.get("manual_model_history", []) or []
+            admin_values = list(dict.fromkeys(list(manual_history[:5]) +
+                                              [m for m in self.top_models_list if m not in manual_history]))
+            model_entry = ctk.CTkComboBox(tab_models, width=450, values=admin_values)
             model_entry.set(self.current_settings.get("admin_model", "openai/gpt-4o-mini"))
         else:
             # ГОСТЬ: Только чтение, список бесплатных моделей
             model_entry = ctk.CTkComboBox(tab_models, width=450, values=self.free_models_list, state="readonly")
             model_entry.set(self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free"))
         model_entry.pack(pady=5)
+
+        # --- Фоновое обновление списков моделей (прокси+ключ; UI — строго через after) ---
+        def _refresh_model_comboboxes():
+            try:
+                if not (settings_window.winfo_exists() and model_entry.winfo_exists()):
+                    return
+                current_value = model_entry.get()
+                if is_admin:
+                    manual_now = self.current_settings.get("manual_model_history", []) or []
+                    new_values = list(dict.fromkeys(list(manual_now[:5]) +
+                                                    [m for m in self.top_models_list if m not in manual_now]))
+                    if new_values:
+                        model_entry.configure(values=new_values)
+                        # Не сбрасываем текущее значение; если его нет в новом списке — добавляем
+                        if current_value and current_value not in new_values:
+                            model_entry.configure(values=[current_value] + new_values)
+                else:
+                    if self.free_models_list:
+                        model_entry.configure(values=self.free_models_list)
+                        if current_value and current_value not in self.free_models_list:
+                            # Гость: значение не из списка бесплатных — сбрасываем на первую
+                            log_core.warning("Гостевая модель '%s' не входит в обновлённый список бесплатных — сброс", current_value)
+                            model_entry.set(self.free_models_list[0])
+                # Синхронно обновляем комбобокс GraphRAG-модели (использует free_models_list)
+                if is_admin and getattr(self, "graph_rag_model_combo", None) is not None:
+                    try:
+                        if self.graph_rag_model_combo.winfo_exists() and self.free_models_list:
+                            gr_val = self.graph_rag_model_combo.get()
+                            self.graph_rag_model_combo.configure(values=self.free_models_list)
+                            if gr_val and gr_val not in self.free_models_list:
+                                self.graph_rag_model_combo.configure(values=[gr_val] + self.free_models_list)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log_ui.warning("Обновление комбобоксов моделей: %s", e)
+
+        threading.Thread(target=self.fetch_free_models, daemon=True).start()
+        threading.Thread(target=self.fetch_top_models, daemon=True).start()
+
+        def _fetch_and_refresh_models():
+            # Оба фетча уже запущены выше параллельно; ждём немного и обновляем UI в главном потоке
+            time.sleep(4)
+            self.after(0, _refresh_model_comboboxes)
+
+        threading.Thread(target=_fetch_and_refresh_models, daemon=True).start()
+        # Повторное обновление после завершения фетчей (на случай медленного прокси)
+        def _fetch_and_refresh_models_slow():
+            time.sleep(12)
+            self.after(0, _refresh_model_comboboxes)
+        threading.Thread(target=_fetch_and_refresh_models_slow, daemon=True).start()
 
         # --- ГЛОБАЛЬНАЯ ТЕМПЕРАТУРА И РАССУЖДЕНИЯ ---
         ctk.CTkLabel(tab_models, text="Базовая Температура (креативность):", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 0))
@@ -5887,6 +6678,7 @@ class App(ctk.CTk):
         groq_entry = None
         tavily_entry = None
         admin_pwd_entry = None
+        sync_password_entry = None
         if is_admin and tab_security is not None:
             vault_data = get_vault_data()
 
@@ -5909,6 +6701,12 @@ class App(ctk.CTk):
             admin_pwd_entry = ctk.CTkEntry(tab_security, width=450, show="*")
             admin_pwd_entry.pack(pady=5)
             admin_pwd_entry.insert(0, vault_data.get("admin_password", "admin"))
+
+            # Пароль синхронизации БД: пустой = ручная синхронизация без пароля (обратная совместимость)
+            ctk.CTkLabel(tab_security, text="Пароль синхронизации БД:").pack(pady=(10, 0))
+            sync_password_entry = ctk.CTkEntry(tab_security, width=450, show="*")
+            sync_password_entry.pack(pady=5)
+            sync_password_entry.insert(0, vault_data.get("sync_password", ""))
 
             ctk.CTkLabel(tab_security, text="XWiki Логин:").pack(pady=(10, 0))
             xwiki_login_entry = ctk.CTkEntry(tab_security, width=450)
@@ -6171,12 +6969,34 @@ class App(ctk.CTk):
                 self.current_settings["proxy_host"] = proxy_host_entry.get().strip() or "127.0.0.1"
                 self.current_settings["proxy_port"] = proxy_port_entry.get().strip() or "2080"
 
-                # 1. Обновление истории топ-10 моделей
+                # 1. Обновление истории топ-10 моделей (для комбобокса модели-аудитора)
                 history = self.current_settings.get("model_history", [])
                 if new_model in history:
                     history.remove(new_model)
                 history.insert(0, new_model)
                 self.current_settings["model_history"] = history[:10] # Храним только 10 последних
+
+                # 1.1 Ручная история: модель не из актуального ТОП-10 -> в manual_model_history (max 5)
+                if new_model and new_model not in self.top_models_list:
+                    manual = self.current_settings.get("manual_model_history", []) or []
+                    if new_model in manual:
+                        manual.remove(new_model)
+                    manual.insert(0, new_model)
+                    self.current_settings["manual_model_history"] = manual[:5]
+                    log_core.info("Модель '%s' добавлена в ручную историю (нет в ТОП-10)", new_model)
+                else:
+                    # Модель из ТОП-10: убираем из ручной истории, если была там
+                    manual = self.current_settings.get("manual_model_history", []) or []
+                    if new_model in manual:
+                        manual.remove(new_model)
+                        self.current_settings["manual_model_history"] = manual[:5]
+
+                # 1.2 Уровень логирования: применяется сразу, без перезапуска
+                if hasattr(self, "log_level_var"):
+                    chosen_level = self.log_level_var.get()
+                    self.current_settings["log_level"] = chosen_level
+                    apply_log_level(chosen_level)
+                    log_core.info("Уровень логирования: %s", chosen_level)
                 
                 # 2. Сохранение остальных системных полей
                 self.global_settings["vision_model"] = vision_entry.get().strip()
@@ -6195,6 +7015,10 @@ class App(ctk.CTk):
                         self.global_settings["graph_rag_window"] = int(self.graph_rag_window_var.get())
                     except Exception:
                         self.global_settings["graph_rag_window"] = 6
+                    try:
+                        self.global_settings["graph_rag_max_tokens"] = int(self.graph_rag_max_tokens_var.get())
+                    except Exception:
+                        self.global_settings["graph_rag_max_tokens"] = 16000
                     try:
                         self.global_settings["graph_rag_text_cap"] = int(self.graph_rag_text_cap_var.get())
                     except Exception:
@@ -6238,6 +7062,7 @@ class App(ctk.CTk):
                     "groq_key": groq_entry.get().strip() if groq_entry else "",
                     "tavily_key": tavily_entry.get().strip() if tavily_entry else "",
                     "admin_password": (admin_pwd_entry.get().strip() if admin_pwd_entry else "admin") or "admin",
+                    "sync_password": sync_password_entry.get().strip() if sync_password_entry else "",
                     "xwiki_login": xwiki_login_entry.get().strip() if xwiki_login_entry else "",
                     "xwiki_password": xwiki_password_entry.get().strip() if xwiki_password_entry else "",
                     "cohere_key": (self.cohere_key_entry.get().strip() if hasattr(self, "cohere_key_entry") and self.cohere_key_entry else "")
@@ -6259,8 +7084,285 @@ class App(ctk.CTk):
             # Применяем горячие клавиши после закрытия настроек
             self.apply_audio_hotkey()
 
+        # --- ПАНЕЛЬ ОБСЛУЖИВАНИЯ (только для админа): уровень логов, просмотрщик, диагностика ---
+        if is_admin:
+            tools_frame = ctk.CTkFrame(settings_window, fg_color="transparent")
+            tools_frame.pack(pady=(2, 4))
+
+            ctk.CTkLabel(tools_frame, text="Уровень логов:").pack(side="left", padx=(0, 5))
+            self.log_level_var = ctk.StringVar(value=str(self.current_settings.get("log_level", "INFO")).upper())
+            log_level_combo = ctk.CTkComboBox(tools_frame, values=["INFO", "DEBUG"], width=110,
+                                              variable=self.log_level_var, state="readonly")
+            log_level_combo.pack(side="left", padx=(0, 15))
+
+            ctk.CTkButton(tools_frame, text="📋 Логи", width=110,
+                          command=self.open_log_viewer).pack(side="left", padx=5)
+            ctk.CTkButton(tools_frame, text="🩺 Диагностика", width=130, fg_color="#455A64",
+                          hover_color="#263238",
+                          command=self.run_diagnostics).pack(side="left", padx=5)
+
+            # Ручная синхронизация БД — перенесена из sidebar; проверка пароля синхронизации из vault
+            def _manual_sync_with_password():
+                sync_pwd = get_vault_data().get("sync_password", "").strip()
+                if not sync_pwd:
+                    self.manual_sync(sync_settings_btn)
+                    return
+                # окно настроек держит grab — отпускаем на время диалога, иначе CTkInputDialog не получит события
+                try:
+                    settings_window.grab_release()
+                except Exception:
+                    pass
+                dlg = ctk.CTkInputDialog(text="Введите пароль синхронизации БД:", title="Синхронизация")
+                entered_pwd = dlg.get_input() if dlg else None
+                try:
+                    if settings_window.winfo_exists():
+                        settings_window.grab_set()
+                except Exception:
+                    pass
+                if entered_pwd == sync_pwd:
+                    self.manual_sync(sync_settings_btn)
+                else:
+                    self.status_label.configure(text="Неверный пароль синхронизации")
+                    log_core.warning("Отказ в ручной синхронизации БД: неверный пароль синхронизации")
+
+            sync_settings_btn = ctk.CTkButton(tools_frame, text="🔄 Синхронизировать базу", width=170,
+                                              fg_color="#2E7D32", hover_color="#1B5E20",
+                                              command=_manual_sync_with_password)
+            sync_settings_btn.pack(side="left", padx=5)
+
         save_btn = ctk.CTkButton(settings_window, text="Сохранить", command=save, fg_color="#2E7D32", hover_color="#1B5E20")
         save_btn.pack(pady=(10, 20))
+
+    # ==================== ПРОСМОТРЩИК ЛОГОВ ====================
+    def open_log_viewer(self):
+        """Окно просмотра логов: хвост файла, фильтры по уровню/модулю, автообновление раз в 3 сек."""
+        import collections
+        win = ctk.CTkToplevel(self)
+        win.title("Логи Агента СМК")
+        win.geometry("900x600")
+        win.transient(self)
+
+        filter_frame = ctk.CTkFrame(win, fg_color="transparent")
+        filter_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        ctk.CTkLabel(filter_frame, text="Уровень:").pack(side="left", padx=(0, 4))
+        level_var = ctk.StringVar(value="ВСЕ")
+        level_combo = ctk.CTkComboBox(filter_frame, values=["ВСЕ", "DEBUG", "INFO", "WARNING", "ERROR"],
+                                      width=110, variable=level_var, state="readonly",
+                                      command=lambda _=None: refresh())
+        level_combo.pack(side="left", padx=(0, 15))
+
+        ctk.CTkLabel(filter_frame, text="Модуль:").pack(side="left", padx=(0, 4))
+        module_var = ctk.StringVar(value="все")
+        module_combo = ctk.CTkComboBox(filter_frame,
+                                       values=["все", "core", "graph", "llm", "sync", "xwiki", "audio", "rag", "ui"],
+                                       width=110, variable=module_var, state="readonly",
+                                       command=lambda _=None: refresh())
+        module_combo.pack(side="left", padx=(0, 15))
+
+        auto_var = ctk.BooleanVar(value=True)
+        auto_check = ctk.CTkCheckBox(filter_frame, text="Автообновление (3 с)", variable=auto_var)
+        auto_check.pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(filter_frame, text="🔄 Обновить", width=110,
+                      command=lambda: refresh()).pack(side="left", padx=5)
+        ctk.CTkButton(filter_frame, text="📂 Открыть папку логов", width=170,
+                      command=lambda: _open_log_dir()).pack(side="left", padx=5)
+
+        textbox = ctk.CTkTextbox(win, wrap="none", font=ctk.CTkFont(family="Consolas", size=12))
+        textbox.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+        textbox.configure(state="disabled")
+
+        def _open_log_dir():
+            try:
+                os.makedirs(get_log_dir(), exist_ok=True)
+                os.startfile(get_log_dir())
+            except Exception as e:
+                log_ui.error("Не удалось открыть папку логов: %s", e)
+
+        def _read_tail(path, max_lines=2000):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    return list(collections.deque(f, maxlen=max_lines))
+            except FileNotFoundError:
+                return ["(лог-файл ещё не создан)"]
+            except Exception as e:
+                return [f"(ошибка чтения лога: {e})"]
+
+        def refresh():
+            lines = _read_tail(get_log_file_path())
+            lvl = level_var.get()
+            mod = module_var.get()
+            out = []
+            for ln in lines:
+                if lvl != "ВСЕ" and f"[{lvl}]" not in ln:
+                    continue
+                if mod != "все" and f"[{mod}]" not in ln:
+                    continue
+                out.append(ln.rstrip("\n"))
+            textbox.configure(state="normal")
+            textbox.delete("1.0", "end")
+            textbox.insert("1.0", "\n".join(out) if out else "(нет строк под выбранные фильтры)")
+            textbox.configure(state="disabled")
+
+        def auto_refresh_loop():
+            if not win.winfo_exists():
+                return  # окно закрыто — останавливаем цикл after
+            if auto_var.get():
+                refresh()
+            win.after(3000, auto_refresh_loop)
+
+        refresh()
+        win.after(3000, auto_refresh_loop)
+
+    # ==================== ДИАГНОСТИКА ====================
+    def run_diagnostics(self):
+        """Кнопка Диагностика: окно отчёта + фоновый поток с проверками (прокси/OpenRouter/БД)."""
+        win = ctk.CTkToplevel(self)
+        win.title("Диагностика Агента СМК")
+        win.geometry("780x520")
+        win.transient(self)
+
+        header = ctk.CTkLabel(win, text="🩺 Диагностика: выполняются проверки...", font=ctk.CTkFont(weight="bold"))
+        header.pack(pady=(10, 5))
+
+        textbox = ctk.CTkTextbox(win, wrap="word", font=ctk.CTkFont(family="Consolas", size=12))
+        textbox.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+        textbox.configure(state="disabled")
+
+        def report(line):
+            def _do():
+                if not win.winfo_exists():
+                    return
+                textbox.configure(state="normal")
+                textbox.insert("end", line + "\n")
+                textbox.see("end")
+                textbox.configure(state="disabled")
+            self.after(0, _do)
+
+        def finish():
+            def _do():
+                if not win.winfo_exists():
+                    return
+                header.configure(text="🩺 Диагностика завершена")
+            self.after(0, _do)
+
+        threading.Thread(target=self._run_diagnostics_worker, args=(report, finish), daemon=True).start()
+
+    def _run_diagnostics_worker(self, report, finish):
+        """Воркер диагностики (фоновый поток). Каждый шаг логируется (core) и пишется в окно отчёта.
+        Диагностика не трогает продакшн-коллекции: Chroma — только count(), sqlite — read-only."""
+        import socket
+
+        def step(name, ok, details=""):
+            status = "ПРОШЛО" if ok else "УПАЛО"
+            line = f"[{'✅' if ok else '❌'}] {name}: {status}" + (f" — {details}" if details else "")
+            log_core.info("Диагностика: %s", line)
+            report(line)
+
+        try:
+            ls = load_local_settings()
+            gs = load_global_settings()
+
+            # 1. Состояние прокси из настроек
+            use_proxy = bool(ls.get("use_proxy", False))
+            proxy_host = ls.get("proxy_host", "127.0.0.1")
+            proxy_port = ls.get("proxy_port", "2080")
+            step("1. Настройки прокси", True,
+                 f"use_proxy={use_proxy}, адрес={proxy_host}:{proxy_port}" if use_proxy else "прокси выключен (прямое соединение)")
+
+            # 2. TCP до openrouter.ai:443 напрямую и через SOCKS
+            try:
+                t0 = time.time()
+                sock = socket.create_connection(("openrouter.ai", 443), timeout=8)
+                sock.close()
+                step("2a. TCP openrouter.ai:443 напрямую", True, f"{time.time() - t0:.2f} с")
+            except Exception as e:
+                step("2a. TCP openrouter.ai:443 напрямую", False, f"{_classify_net_error(e)}: {e}")
+            if use_proxy:
+                try:
+                    t0 = time.time()
+                    # SOCKS-проверка: PySocks подменяет socket, если импортирован и прокси задан вручную
+                    import socks  # PySocks (зависимость requests[socks])
+                    s = socks.socksocket()
+                    s.set_proxy(socks.SOCKS5, proxy_host, int(proxy_port))
+                    s.settimeout(8)
+                    s.connect(("openrouter.ai", 443))
+                    s.close()
+                    step("2b. TCP openrouter.ai:443 через SOCKS-прокси", True, f"{time.time() - t0:.2f} с")
+                except Exception as e:
+                    step("2b. TCP openrouter.ai:443 через SOCKS-прокси", False,
+                         f"{_classify_net_error(e)}: {e} (проверьте, запущен ли VPN/прокси)")
+            else:
+                report("[⏭] 2b. TCP через SOCKS-прокси: пропущено (прокси выключен)")
+
+            # 3. GET /api/v1/models с ключом
+            api_key = get_vault_data().get("openrouter_key", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+            try:
+                if not api_key:
+                    raise PermissionError("Ключ OpenRouter не задан (Vault/env)")
+                proxy_url = _proxy_url_from_settings()
+                proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+                resp = requests.get("https://openrouter.ai/api/v1/models",
+                                    headers={"Authorization": f"Bearer {api_key}"},
+                                    proxies=proxies, timeout=15)
+                if resp.status_code == 200:
+                    step("3. OpenRouter API (GET /api/v1/models)", True, f"HTTP 200, моделей: {len(resp.json().get('data', []))}")
+                else:
+                    step("3. OpenRouter API (GET /api/v1/models)", False, f"HTTP {resp.status_code}")
+            except Exception as e:
+                step("3. OpenRouter API (GET /api/v1/models)", False, f"{_classify_net_error(e)}: {_mask_secrets(e)}")
+
+            # 4. Тест эмбеддинга (env-прокси путь OpenAIEmbeddingFunction)
+            try:
+                t0 = time.time()
+                ef = get_cloud_ef()
+                vec = ef(["тест"])
+                dim = len(list(vec)[0]) if vec else 0
+                step("4. Эмбеддинги (get_cloud_ef)", True, f"модель={gs.get('embedding_model', '')}, размерность={dim}, {time.time() - t0:.2f} с")
+            except Exception as e:
+                step("4. Эмбеддинги (get_cloud_ef)", False, f"{_classify_net_error(e)}: {_mask_secrets(e)}")
+
+            # 5. Chroma: открытие коллекции smk_docs + count()
+            try:
+                t0 = time.time()
+                client = chromadb.PersistentClient(path=get_db_path(pull=False))
+                coll = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
+                step("5. Chroma (коллекция smk_docs)", True, f"чанков: {coll.count()}, {time.time() - t0:.2f} с")
+            except Exception as e:
+                step("5. Chroma (коллекция smk_docs)", False, f"{_classify_net_error(e)}: {e}")
+
+            # 6. SQLite graph_rag.db: integrity_check + счётчики
+            try:
+                conn = sqlite3.connect(get_graph_db_path(pull=False), timeout=15)
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()
+                rel_count = conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+                chunk_count = conn.execute("SELECT COUNT(*) FROM processed_chunks").fetchone()[0]
+                conn.close()
+                ok_db = bool(integrity) and str(integrity[0]).lower() == "ok"
+                step("6. SQLite graph_rag.db", ok_db,
+                     f"integrity={integrity[0] if integrity else '?'}, relations={rel_count}, processed_chunks={chunk_count}")
+            except Exception as e:
+                step("6. SQLite graph_rag.db", False, f"{_classify_net_error(e)}: {e}")
+
+            # 7. Мини-вызов chat.completions на текущей graph_rag_model
+            model = gs.get("graph_rag_model", "")
+            try:
+                t0 = time.time()
+                get_llm_client().chat.completions.create(
+                    model=model, max_tokens=1,
+                    messages=[{"role": "user", "content": "."}], timeout=20)
+                step("7. LLM-модель GraphRAG", True, f"model={model}, {time.time() - t0:.2f} с")
+            except Exception as e:
+                step("7. LLM-модель GraphRAG", False,
+                     f"model={model}, {_classify_net_error(e)}: {_mask_secrets(e)} — проверьте, существует ли ID модели")
+
+            report("\nДиагностика завершена. Сеть/прокси = пункты 2-3; БД = пункты 5-6; модель GraphRAG = пункт 7.")
+        except Exception as e:
+            log_core.exception("Диагностика: общая ошибка")
+            report(f"\n[❌] Диагностика прервана ошибкой: {e}")
+        finally:
+            finish()
 
     # ==================== ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ====================
     def get_tools_schema(self):
@@ -6589,7 +7691,7 @@ class App(ctk.CTk):
                 "type": "function",
                 "function": {
                     "name": "execute_python_code",
-                    "description": "Выполняет Python код. Используется для анализа Excel файлов с помощью pandas. Возвращает stdout.",
+                    "description": "Выполняет Python код. Используется для анализа Excel файлов с помощью pandas. Возвращает stdout. Путь к прикреплённому файлу берите строго из системного промпта — файл уже локален, не используйте сетевые пути без прямой необходимости.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -6628,7 +7730,7 @@ class App(ctk.CTk):
                 "type": "function",
                 "function": {
                     "name": "query_knowledge_graph",
-                    "description": "Искать структурные связи в графе СМК (кто кому подчиняется, какие процессы связаны, потоки в схемах). Используй для анализа структуры/иерархии, а не как замену текстового поиска.",
+                    "description": "Обязательный второй шаг после текстового поиска по базе (search_smk_knowledge_base) при вопросах о структуре, иерархии и связях СМК: кто кому подчиняется, какие процессы связаны, потоки в схемах. Для каждого триплета возвращает файл-источник и дословный фрагмент-подтверждение; пометка «частичное подтверждение» означает, что во фрагменте дословно есть только одна сущность — используй его осторожно; пометка «фрагмент не найден» означает, что связь известна только из графа. Не замена текстового поиска.",
                     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
                 }
             })
@@ -6641,7 +7743,7 @@ class App(ctk.CTk):
 
         # Защищаем служебные ссылки от искажения моделью-аудитором
         link_map = {}
-        link_pattern = r"(\[(?:Вложение:|Из файла:)[^\]]+\])"
+        link_pattern = r"(\[(?:Вложение:|Из файла:|Из схемы:)[^\]]+\])"
         link_index = 0
 
         def _shield_link(match):
@@ -6722,15 +7824,22 @@ class App(ctk.CTk):
             "temperature": 0.1  # Строгость аудитора
         }
 
+        t0 = time.time()
         try:
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json=payload,
+                proxies=(lambda p: {"http": p, "https": p} if p else None)(_proxy_url_from_settings()),
                 timeout=60
             )
             response.raise_for_status()
-            audited_text = response.json()["choices"][0]["message"]["content"].strip()
+            resp_json = response.json()
+            audited_text = resp_json["choices"][0]["message"]["content"].strip()
+            usage = resp_json.get("usage") or {}
+            log_llm.info("Deep Audit: model=%s, latency=%.2fs, status=ok, prompt_tokens=%s, completion_tokens=%s",
+                         audit_model, time.time() - t0,
+                         usage.get("prompt_tokens"), usage.get("completion_tokens"))
 
             # Возвращаем оригинальные ссылки в итоговый текст
             for placeholder, original_link in link_map.items():
@@ -6743,10 +7852,12 @@ class App(ctk.CTk):
                 error_body = e.response.text[:1000] if e.response is not None else ""
             except Exception:
                 pass
-            print(f"[Deep Audit] ⚠️ HTTP ошибка аудита: {e}. model={audit_model}. body={error_body}")
+            log_llm.error("Deep Audit: HTTP ошибка (%s), model=%s: %s body=%s",
+                          _classify_net_error(e), audit_model, _mask_secrets(e), _mask_secrets(error_body))
             return draft_answer
         except Exception as e:
-            print(f"[Deep Audit] ⚠️ Ошибка аудита: {e}. Возвращаю черновик без проверки.")
+            log_llm.error("Deep Audit: ошибка (%s), model=%s: %s. Возвращаю черновик без проверки.",
+                          _classify_net_error(e), audit_model, _mask_secrets(e))
             return draft_answer
 
     def execute_tool(self, func_name, args):
@@ -6893,6 +8004,16 @@ class App(ctk.CTk):
         self.chat_textbox.see("end")
         self.chat_textbox.configure(state="disabled")
         
+        # ШАГ 1.5 — обязательный поиск по графу (только при включённом GraphRAG)
+        graph_step = ""
+        if self.global_settings.get("graph_rag_enabled"):
+            graph_step = (
+                "ШАГ 1.5. ГРАФ СВЯЗЕЙ: СНАЧАЛА 'search_smk_knowledge_base', ЗАТЕМ ОБЯЗАТЕЛЬНО 'query_knowledge_graph' "
+                "с уточнённым запросом, и только потом формулируй ответ. Граф дополняет базу структурными связями "
+                "(иерархия, подчинение, связи процессов). Пропуск шага графа при включённом инструменте запрещён. "
+                "Граф строится постепенно — если связей не нашлось, так и скажи, не выдумывай.\n"
+            )
+
         system_prompt = (
             "Система автоматически помечает сообщения в истории скрытым тегом [MSG_ID: X]. "
             "Если пользователь ссылается на номера ответов, ищи этот тег. "
@@ -6901,6 +8022,7 @@ class App(ctk.CTk):
             "Ты суперинтеллектуальный автономный агент СМК.\n"
             "ТВОЙ СТРОГИЙ АЛГОРИТМ РАБОТЫ:\n"
             "ШАГ 1. СВЕРКА: При любом запросе СНАЧАЛА вызывай 'search_smk_knowledge_base'.\n"
+            f"{graph_step}"
             "ШАГ 1.1. ПРОВЕРКА ИНТЕРНЕТА: Если в локальной базе знаний нет ответа на вопрос пользователя, ты НЕ ИМЕЕШЬ ПРАВА сразу придумывать ответ или искать его в сети. Сначала напиши пользователю: 'В нашей локальной базе СМК нет этой информации. Где мне поискать ответ: в интернете (Tavily) или в Википедии?'.\n"
             "ШАГ 1.2. Дождись ответа. Если пользователь выбрал интернет - вызови 'web_search_tavily'. Если Википедию - вызови 'search_wikipedia'. ПРИ ОТВЕТЕ ИЗ ВНЕШНЕЙ СЕТИ ОБЯЗАТЕЛЬНО УКАЗЫВАЙ ПРЯМЫЕ ВЕБ-ССЫЛКИ на источники (http...).\n"
             "ШАГ 1.3. АУДИОФАЙЛЫ: Если пользователь просит тебя проанализировать или пересказать аудиофайл, ВЫЗОВИ инструмент 'read_local_file' с именем этого аудио. Инструмент сам достанет текст из кэша. Если же в кэше пусто (инструмент вернет предупреждение), ТЫ НЕ ИМЕЕШЬ ПРАВА вызывать 'transcribe_audio_file' без разрешения. Обязательно спроси: 'Я вижу аудиофайл. Запустить расшифровку голоса в текст?'. Вызывай 'transcribe_audio_file' ТОЛЬКО после слова 'Да' от пользователя. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать 'read_local_file' для файлов изображений из XWiki, если их описание уже присутствует в тексте документа в блоке [!MEDIA]. Используй уже имеющееся описание.\n"
@@ -6918,14 +8040,6 @@ class App(ctk.CTk):
             "ШАГ 9. КЛИКАБЕЛЬНЫЕ ССЫЛКИ НА ФАЙЛЫ И XWIKI: Если ты упоминаешь документ СМК, нашел его через поиск или даешь ссылку на веб-страницу XWiki, ОБЯЗАТЕЛЬНО выводи её в строгом формате: [Из файла: URL_или_Имя_файла]. НИКОГДА не пиши URL открытым текстом, всегда оборачивай в [Из файла: https://...]!\n"
             "ШАГ 10. ОБРАБОТКА ВЛОЖЕНИЙ: Если в контексте или тексте документа ты видишь якорь вида [Вложение: путь_к_файлу], СТРОГО ЗАПРЕЩЕНО выдумывать или гадать о содержимом этого файла. Ты должен написать пользователю: 'К данному документу прикреплен файл <имя файла>. Хотите, я прочитаю его содержимое?'. Если пользователь отвечает согласием (да, давай, читай и т.д.), немедленно используй инструмент read_local_file, передав ему путь из якоря (например, attachments/abc123_имя_файла.doc).\n"
         )
-
-        # ШАГ 11 — только при включённом GraphRAG
-        if self.global_settings.get("graph_rag_enabled"):
-            system_prompt += (
-                "\nШАГ 11. ГРАФ СВЯЗЕЙ: Если включён инструмент 'query_knowledge_graph', используй его для поиска структурных связей "
-                "(кто кому подчиняется, какие процессы связаны, потоки между блоками схем). "
-                "Применяй его как дополнение к 'search_smk_knowledge_base' при вопросах об иерархии, подчинении и структуре процессов.\n"
-            )
 
         # --- КОНТРОЛЬ АВТОНОМНОГО ЧТЕНИЯ ---
         is_auto_read = True
@@ -6976,6 +8090,7 @@ class App(ctk.CTk):
                         create_params["reasoning_effort"] = excel_params["reasoning_effort"]
                 
                 max_retries = 3
+                t_call = time.time()
                 for retry in range(max_retries):
                     try:
                         response = get_llm_client().chat.completions.create(**create_params)
@@ -6984,10 +8099,21 @@ class App(ctk.CTk):
                         if retry < max_retries - 1 and ("429" in str(api_err) or "rate" in str(api_err).lower()):
                             import time as _time
                             wait_time = (2 ** retry) + 1
+                            log_llm.warning("agent_loop: %s, ретрай %d/%d через %d c (model=%s)",
+                                            _classify_net_error(api_err), retry + 1, max_retries, wait_time, current_model)
                             self.after(0, self.append_to_chat, f"\n[⏳ Rate limit. Ожидание {wait_time}с...]\n")
                             _time.sleep(wait_time)
                         else:
                             raise
+                log_llm.info("agent_loop: model=%s, latency=%.2fs, status=ok, step=%d",
+                             current_model, time.time() - t_call, step)
+                # DEBUG: превью последнего user-сообщения (НЕ системный промпт, НЕ документы)
+                try:
+                    _last_user = next((m.get("content", "") for m in reversed(messages_for_llm)
+                                       if m.get("role") == "user"), "")
+                    log_llm.debug("agent_loop: user-превью: %s", _mask_secrets(str(_last_user)[:500]))
+                except Exception:
+                    pass
 
                 content_parts = []
                 tool_calls_acc = {}
@@ -7104,7 +8230,8 @@ class App(ctk.CTk):
 
                         except Exception as audit_err:
                             # --- Graceful Fallback (ШАГ 5) ---
-                            print(f"[Deep Audit] Ошибка аудитора: {audit_err}")
+                            log_llm.error("Deep Audit: ошибка аудитора (%s): %s",
+                                          _classify_net_error(audit_err), _mask_secrets(audit_err))
 
                             # Удаляем временное сообщение из чата
                             self.chat_textbox.configure(state="normal")
@@ -7158,7 +8285,7 @@ class App(ctk.CTk):
                                     ids=[str(uuid.uuid4())]
                                 )
                             except Exception as e:
-                                print(f"Ошибка архивации чата: {e}")
+                                log_rag.error("Ошибка архивации чата (%s): %s", _classify_net_error(e), e)
 
                     self.save_current_session()
                     break
@@ -7207,6 +8334,10 @@ class App(ctk.CTk):
                      
             except Exception as e:
                 error_str = str(e).lower()
+                log_llm.error("agent_loop: критическая ошибка (%s), model=%s: %s",
+                              _classify_net_error(e),
+                              self.current_settings.get("admin_model" if getattr(self, "current_role", "guest") == "admin" else "guest_model", ""),
+                              _mask_secrets(e))
                 if "context_length_exceeded" in error_str or "maximum context length" in error_str or "400" in error_str:
                     self.append_to_chat("\n[⚠️ Ошибка: Объем прикрепленных файлов превышает лимит памяти нейросети. Пожалуйста, удалите часть файлов или разбейте документ на части.]\n\n")
                 else:
