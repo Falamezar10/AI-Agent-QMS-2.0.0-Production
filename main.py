@@ -7,6 +7,8 @@ import uuid
 import glob
 import os
 import hashlib
+import unicodedata
+import difflib
 import sys
 os.environ["CHROMA_TELEMETRY_DISABLED"] = "1"
 import base64
@@ -339,6 +341,69 @@ def get_local_path():
     os.makedirs(app_dir, exist_ok=True)
     return app_dir
 
+def _pull_db_from_server(server_db, local_db):
+    """Надёжное теневое копирование сервер → локально: copytree во временную папку
+    + атомарная замена двумя rename. При сбое локальная база остаётся СТАРОЙ.
+    Сайдкары SQLite (-wal/-shm) не копируем: на сервере их быть не должно (серверную
+    базу никто не открывает), а протухший -wal с чужой солью SQLite молча отбросит."""
+    import shutil, glob
+    import chromadb.api.client
+
+    # 0) Чистим осиротевшие временные папки: свои — всегда, чужие — старше 1 часа
+    now = time.time()
+    for p in glob.glob(local_db + ".tmp_*") + glob.glob(local_db + ".old_*"):
+        try:
+            if p.endswith(f"_{os.getpid()}") or now - os.path.getmtime(p) > 3600:
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+
+    tmp_db = f"{local_db}.tmp_{os.getpid()}"
+    old_db = f"{local_db}.old_{os.getpid()}"
+    shutil.rmtree(tmp_db, ignore_errors=True)
+    shutil.rmtree(old_db, ignore_errors=True)
+    try:
+        # clear_system_cache ДО подмены: инстансы Chroma, созданные ДО неё, продолжат
+        # работать с папкой .old до её удаления — не хуже текущего поведения
+        # (сегодня rmtree убивает хэндлы живой папки посреди работы).
+        try:
+            chromadb.api.client.SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
+        shutil.copytree(server_db, tmp_db,
+                        ignore=shutil.ignore_patterns("*.db-wal", "*.db-shm"))
+        if os.path.exists(local_db):
+            os.rename(local_db, old_db)
+        try:
+            os.rename(tmp_db, local_db)
+        except Exception:
+            if os.path.exists(old_db) and not os.path.exists(local_db):
+                try:
+                    os.rename(old_db, local_db)  # откат: локальная база остаётся старой
+                except Exception:
+                    log_sync.error("Откат репликации не удался — прежняя база лежит в %s", old_db)
+            raise
+    except Exception as e:
+        shutil.rmtree(tmp_db, ignore_errors=True)
+        log_sync.error("Ошибка репликации БД (теневое копирование, локальная база не тронута): %s", e)
+        return False
+    shutil.rmtree(old_db, ignore_errors=True)
+    return True
+
+def _warn_vector_db_lag():
+    """Лёгкая проверка (БЕЗ копирования): серверная база векторов новее локальной реплики?
+    При отставании — warning в лог графа с датой серверной базы. Не бросает исключений."""
+    try:
+        srv = os.path.join(get_base_path(), "smk_vector_db", "chroma.sqlite3")
+        loc = os.path.join(get_local_path(), "local_vector_db", "chroma.sqlite3")
+        if os.path.exists(srv) and os.path.exists(loc) and os.path.getmtime(srv) > os.path.getmtime(loc):
+            srv_ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(srv)))
+            log_graph.warning("Граф: локальная копия векторов старше серверной (сервер от %s) — "
+                              "строим по локальной; изменённые документы подтянутся при ближайшей "
+                              "синхронизации, якоря починит автолечение", srv_ts)
+    except Exception:
+        pass
+
 def get_db_path(pull=True):
     """Теневая репликация: стягивает серверную БД на SSD пользователя для быстрой и безопасной работы.
     pull=False — только путь без репликации (диагностика/чтение): не трогаем живую локальную БД
@@ -360,14 +425,7 @@ def get_db_path(pull=True):
                 needs_pull = True
 
         if needs_pull:
-            # Принудительно освобождаем файлы БД перед перезаписью
-            try: chromadb.api.client.SharedSystemClient.clear_system_cache()
-            except: pass
-            try:
-                shutil.rmtree(local_db, ignore_errors=True)
-                shutil.copytree(server_db, local_db)
-            except Exception as e:
-                log_sync.error("Ошибка репликации БД (теневое копирование): %s", e)
+            _pull_db_from_server(server_db, local_db)
 
     os.makedirs(local_db, exist_ok=True)
     return local_db
@@ -479,6 +537,68 @@ def get_llm_client():
                                                  api_key=openrouter_key, http_client=http_client)
             _LLM_CLIENT_CACHE["sig"] = sig
         return _LLM_CLIENT_CACHE["client"]
+
+
+class VisionAPIError(Exception):
+    """Сбой распознавания Vision API. kind — классификация из _classify_net_error
+    либо NO_KEY / CIRCUIT_OPEN. failed_pages — номера нераспознанных страниц PDF,
+    partial_text — успешно распознанная часть (для контекста чата)."""
+    def __init__(self, message, kind="UNKNOWN", failed_pages=None, partial_text=None):
+        super().__init__(message)
+        self.kind = kind
+        self.failed_pages = failed_pages or []
+        self.partial_text = partial_text
+
+
+# Состояние цепи сбоев Vision OCR (глобальное; живёт в рамках одной синхронизации)
+_VISION_CIRCUIT = {"streak": 0, "kind": None, "open": False}
+
+
+def _vision_circuit_reset():
+    """Сброс цепи сбоев: новый цикл распознавания начинает с чистого состояния."""
+    _VISION_CIRCUIT.update(streak=0, kind=None, open=False)
+
+
+def _vision_circuit_register(kind):
+    """Регистрация сбоя Vision: 3 подряд одинаковых kind размыкают цепь до конца
+    синхронизации. Возвращает True, если цепь разомкнута."""
+    if _VISION_CIRCUIT["kind"] == kind:
+        _VISION_CIRCUIT["streak"] += 1
+    else:
+        _VISION_CIRCUIT.update(streak=1, kind=kind)
+    if _VISION_CIRCUIT["streak"] >= 3 and not _VISION_CIRCUIT["open"]:
+        _VISION_CIRCUIT["open"] = True
+        if kind == "GEOBLOCK_403":
+            # Диагностика как у графа-паука: зонд связи к OpenRouter
+            _ok, probe_kind = _check_llm_connectivity()
+            log_core.error("Vision OCR: OpenRouter недоступен (probe=%s) — распознавание остановлено до следующей синхронизации. Проверьте прокси/ключ.", probe_kind)
+        else:
+            log_core.error("Vision OCR: %d подряд сбоев (%s) — распознавание остановлено до следующей синхронизации.", _VISION_CIRCUIT["streak"], kind)
+    return _VISION_CIRCUIT["open"]
+
+
+def _vision_cache_path(filepath):
+    """Единая точка расчёта пути vision-кэша: .cache/<имя_без_расширения>_<hash6>_vision.md.
+    Используется и в XWiki fast-path для проверки наличия кэша у картинок."""
+    filename = os.path.basename(filepath)
+    name_without_ext = os.path.splitext(filename)[0]
+    abs_path = os.path.abspath(filepath)
+    path_hash = hashlib.md5(abs_path.encode('utf-8')).hexdigest()[:6]
+    return os.path.join(get_base_path(), ".cache", f"{name_without_ext}_{path_hash}_vision.md")
+
+
+def _parse_vision_page_markers(text):
+    """Разбор постраничного vision-кэша по маркерам «--- Страница N (Vision OCR|Native Text) ---».
+    Возвращает {номер_страницы: текстовый_блок_целиком_с_маркером}.
+    Обратная совместимость: старые полные кэши читаются тем же парсером."""
+    pages = {}
+    marker_re = re.compile(r'^--- Страница (\d+) \((Vision OCR|Native Text)\) ---\s*$', re.MULTILINE)
+    matches = list(marker_re.finditer(text))
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        pages[int(m.group(1))] = text[start:end].strip("\n")
+    return pages
 
 _CLOUD_EF_CACHE = {"ef": None, "sig": None}
 
@@ -633,6 +753,402 @@ def read_docx_with_indices(filepath):
             result.append(f"[{i}] {text}")
     return '\n'.join(result), paras
 
+
+def _format_comments_block(filename, entries, limit=20000):
+    """Единый формат блока комментариев для инструмента read_file_comments.
+
+    entries — список кортежей (место, автор, дата, текст); место приходит готовым:
+    для docx — «к абзацу [i] «цитата»» / «к «цитата»» или пустое, для xlsx — адрес вида "Лист 'Лист1'!B2".
+    Лимит 20000 символов с пометкой об обрезке.
+    """
+    lines = []
+    for place, author, date, text in entries:
+        head_parts = []
+        if place:
+            head_parts.append(place)
+        if author:
+            head_parts.append(author)
+        if date:
+            head_parts.append(date.split("T")[0])
+        head = " · ".join(head_parts)
+        lines.append(f"• {head}: {text}" if head else f"• {text}")
+    body = "\n".join(lines)
+    if len(body) > limit:
+        body = body[:limit] + f"\n... (блок обрезан: всего символов {len(body)})"
+    return f"Комментарии из файла '{filename}' ({len(entries)} шт.):\n{body}"
+
+
+def _quote_anchor(text, limit=120):
+    """Готовит цитату-якорь комментария: схлопывает пробельные символы и обрезает по лимиту.
+
+    Возвращает непустую строку или "" (если якорь пустой или состоит из пробелов).
+    """
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) > limit:
+        return cleaned[:limit] + "…"
+    return cleaned
+
+
+def _extract_docx_comment_anchors(document_xml_bytes):
+    """Карта w:id -> плоский текст диапазона commentRangeStart..commentRangeEnd из word/document.xml.
+
+    Вложенные и пересекающиеся диапазоны имеют независимые буферы: каждый w:t
+    дописывается во все открытые диапазоны. End без Start игнорируется,
+    Start без End отбрасывается. Любая ошибка разбора -> {} (деградация до
+    комментария без привязки, не падение).
+    """
+    try:
+        w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        root = ET.fromstring(document_xml_bytes)
+        start_tag = f"{{{w_ns}}}commentRangeStart"
+        end_tag = f"{{{w_ns}}}commentRangeEnd"
+        t_tag = f"{{{w_ns}}}t"
+        id_attr = f"{{{w_ns}}}id"
+        open_ranges, anchors = {}, {}
+        for p in root.iter(f"{{{w_ns}}}p"):
+            for el in p.iter():
+                if el.tag == start_tag:
+                    w_id = el.get(id_attr) or ""
+                    if w_id:
+                        open_ranges.setdefault(w_id, [])
+                elif el.tag == end_tag:
+                    w_id = el.get(id_attr) or ""
+                    if w_id in open_ranges:
+                        anchors[w_id] = "".join(open_ranges.pop(w_id))
+                elif el.tag == t_tag:
+                    text = el.text or ""
+                    if text and open_ranges:
+                        for buf in open_ranges.values():
+                            buf.append(text)
+        return anchors
+    except Exception as e:
+        print(f"Ошибка извлечения якорей комментариев из document.xml: {e}")
+        return {}
+
+
+def _extract_docx_comments(path, paras=None):
+    """Извлекает комментарии из .docx (word/comments.xml, zip+xml.etree, без новых зависимостей).
+
+    paras — плоский список абзацев из get_all_paragraphs (та же нумерация [i],
+    что в тексте вложения от read_docx_with_indices); место комментария резолвится
+    строго по тексту (не по порядку XML): точный матч якоря -> вычищенный от
+    пробелов матч -> начало якоря (кросс-абзацный диапазон).
+    Возвращает (count, block|None): count=0 -> (0, None).
+    Ошибка разбора не роняет вложение — (0, None) + сообщение в консоль.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            if "word/comments.xml" not in names:
+                return 0, None
+            raw = zf.read("word/comments.xml")
+            doc_xml = zf.read("word/document.xml") if "word/document.xml" in names else None
+        w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        c_root = ET.fromstring(raw)
+        anchors = _extract_docx_comment_anchors(doc_xml) if doc_xml else {}
+        texts, strip_texts = None, None
+        if paras is not None:
+            try:
+                texts = [p.text or "" for p in paras]
+                strip_texts = [re.sub(r"\s+", "", t) for t in texts]
+            except Exception:
+                texts, strip_texts = None, None
+        entries = []
+        for c in c_root.findall(f"{{{w_ns}}}comment"):
+            author = (c.get(f"{{{w_ns}}}author") or "").strip()
+            date = (c.get(f"{{{w_ns}}}date") or "").strip()
+            text = "".join(t.text or "" for t in c.iter(f"{{{w_ns}}}t")).strip()
+            if not text:
+                continue
+            anchor = anchors.get(c.get(f"{{{w_ns}}}id") or "", "") or ""
+            place = ""
+            quote = _quote_anchor(anchor)
+            if quote:
+                strip_anchor = re.sub(r"\s+", "", anchor)
+                matched_idx = None
+                if texts is not None:
+                    for i, t in enumerate(texts):
+                        if anchor in t:
+                            matched_idx = i
+                            break
+                    if matched_idx is None and len(strip_anchor) >= 4:
+                        for i, st in enumerate(strip_texts):
+                            if strip_anchor in st:
+                                matched_idx = i
+                                break
+                    if matched_idx is None and len(strip_anchor) >= 8:
+                        head = strip_anchor[:40]
+                        for i, st in enumerate(strip_texts):
+                            if head in st:
+                                matched_idx = i
+                                break
+                place = f"к абзацу [{matched_idx}] «{quote}»" if matched_idx is not None else f"к «{quote}»"
+            entries.append((place, author or "Неизвестный автор", date, text))
+        if not entries:
+            return 0, None
+        return len(entries), _format_comments_block(os.path.basename(path), entries)
+    except Exception as e:
+        print(f"Ошибка извлечения комментариев из {os.path.basename(path)}: {e}")
+        return 0, None
+
+
+def _extract_xlsx_comments_openpyxl(path):
+    """Резервное извлечение примечаний из .xlsx через openpyxl (только видимые листы).
+
+    Вызывается при сбое/пустоте XML-разбора; дату не отдает (openpyxl её не хранит).
+    """
+    try:
+        wb = openpyxl.load_workbook(path)
+        entries = []
+        for ws in wb.worksheets:
+            if ws.sheet_state != "visible":
+                continue
+            for row in ws.iter_rows():
+                for cell in row:
+                    cm = cell.comment
+                    if cm is not None and (cm.text or "").strip():
+                        entries.append((
+                            f"Лист '{ws.title}'!{cell.coordinate}",
+                            (cm.author or "").strip() or "Неизвестный автор",
+                            "",
+                            cm.text.strip()
+                        ))
+        wb.close()
+        if not entries:
+            return 0, None
+        return len(entries), _format_comments_block(os.path.basename(path), entries)
+    except Exception as e:
+        print(f"Ошибка fallback-извлечения примечаний из {os.path.basename(path)}: {e}")
+        return 0, None
+
+
+def _extract_xlsx_comments(path):
+    """Извлекает примечания/обсуждения из .xlsx (legacy xl/commentsN.xml + xl/threadedComments).
+
+    Листы разрешаются через workbook.xml + rels; учитываются только видимые листы.
+    Дедупликация по адресу ячейки: threaded-источник приоритетнее legacy-зеркала.
+    Возвращает (count, block|None); при пустом XML-разборе — fallback на openpyxl.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            # Excel пишет legacy-примечания в xl/commentsN.xml, openpyxl — в xl/comments/commentN.xml
+            legacy_files = sorted(
+                (n for n in names if re.fullmatch(r"xl/(?:comments\d+|comments/comment\d+)\.xml", n)),
+                key=lambda n: int(re.search(r"\d+", n).group())
+            )
+            threaded_files = sorted(
+                (n for n in names if re.fullmatch(r"xl/threadedComments/threadedComment\d+\.xml", n)),
+                key=lambda n: int(re.search(r"\d+", n).group())
+            )
+            if not legacy_files and not threaded_files:
+                return 0, None
+
+            main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+            r_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+            # Карта листов: "sheet1.xml" -> (имя листа, видимость)
+            sheet_info_by_target = {}
+            try:
+                wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
+                rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+                target_by_id = {rel.get("Id"): (rel.get("Target") or "") for rel in rels_root}
+                sheets_el = wb_root.find(f"{{{main_ns}}}sheets")
+                for sh in (sheets_el if sheets_el is not None else []):
+                    tgt_base = os.path.basename(target_by_id.get(sh.get(f"{{{r_ns}}}id") or "", ""))
+                    sheet_info_by_target[tgt_base] = (
+                        sh.get("name") or "",
+                        (sh.get("state") or "visible") == "visible"
+                    )
+            except Exception:
+                pass
+
+            # Карта файлов комментариев -> имя видимого листа (через rels листов)
+            comments_sheet_by_file = {}
+            for n in names:
+                m = re.fullmatch(r"xl/worksheets/_rels/sheet(\d+)\.xml\.rels", n)
+                if not m:
+                    continue
+                try:
+                    for rel in ET.fromstring(zf.read(n)):
+                        tgt_base = os.path.basename(rel.get("Target") or "")
+                        if (re.fullmatch(r"(?:comments?\d+|threadedComment\d+)\.xml", tgt_base)
+                                and tgt_base not in comments_sheet_by_file):
+                            info = sheet_info_by_target.get(f"sheet{m.group(1)}.xml")
+                            if info and info[1]:
+                                comments_sheet_by_file[tgt_base] = info[0]
+                except Exception:
+                    continue
+
+            # personId -> отображаемое имя (для threaded-обсуждений)
+            person_name_by_id = {}
+            for n in names:
+                if re.fullmatch(r"xl/threadedComments/persons/person\d*\.xml", n):
+                    try:
+                        for p in ET.fromstring(zf.read(n)):
+                            person_name_by_id[p.get("personId", "")] = (p.get("displayName") or "").strip()
+                    except Exception:
+                        continue
+
+            def _join_text(el):
+                return "".join(t.text or "" for t in el.iter(f"{{{main_ns}}}t")).strip()
+
+            def _make_place(sheet_name, ref):
+                return f"Лист '{sheet_name}'!{ref}" if sheet_name else f"Ячейка {ref}"
+
+            entries = {}  # (лист, ячейка) -> (место, автор, дата, текст)
+
+            # Сначала threaded (основной источник), затем legacy — дедупликация по ячейке
+            for tf in threaded_files:
+                sheet_name = comments_sheet_by_file.get(os.path.basename(tf), "")
+                try:
+                    for tc in ET.fromstring(zf.read(tf)).findall(f"{{{main_ns}}}threadedComment"):
+                        ref = (tc.get("ref") or "").strip()
+                        if not ref:
+                            continue
+                        author = person_name_by_id.get(tc.get("personId", ""), "").strip()
+                        date = (tc.get("dT") or "").strip()
+                        # Текст обсуждения: обычный текст в <text> (Excel/openpyxl) или раны <r><t>
+                        replies = []
+                        for txt in tc.findall(f"{{{main_ns}}}text"):
+                            part = "".join([txt.text or ""] + [t.text or "" for t in txt.iter(f"{{{main_ns}}}t")]).strip()
+                            if part:
+                                replies.append(part)
+                        body = "\n".join(replies)
+                        if body:
+                            entries[(sheet_name, ref)] = (
+                                _make_place(sheet_name, ref),
+                                author or "Неизвестный автор",
+                                date,
+                                body
+                            )
+                except Exception as ce:
+                    print(f"Ошибка разбора {os.path.basename(tf)} в {os.path.basename(path)}: {ce}")
+
+            for cf in legacy_files:
+                sheet_name = comments_sheet_by_file.get(os.path.basename(cf), "")
+                try:
+                    c_root = ET.fromstring(zf.read(cf))
+                    authors_el = c_root.find(f"{{{main_ns}}}authors")
+                    authors = [a.text or "" for a in (authors_el if authors_el is not None else [])]
+                    for cl in c_root.findall(f"{{{main_ns}}}commentList/{{{main_ns}}}comment"):
+                        ref = (cl.get("ref") or "").strip()
+                        if not ref:
+                            continue
+                        key = (sheet_name, ref)
+                        if key in entries:
+                            continue
+                        try:
+                            author = authors[int(cl.get("authorId", "0"))].strip()
+                        except Exception:
+                            author = ""
+                        body = ""
+                        text_el = cl.find(f"{{{main_ns}}}text")
+                        if text_el is not None:
+                            body = _join_text(text_el)
+                        if body:
+                            entries[key] = (
+                                _make_place(sheet_name, ref),
+                                author or "Неизвестный автор",
+                                "",
+                                body
+                            )
+                except Exception as ce:
+                    print(f"Ошибка разбора {os.path.basename(cf)} в {os.path.basename(path)}: {ce}")
+
+        if not entries:
+            return _extract_xlsx_comments_openpyxl(path)
+        return len(entries), _format_comments_block(os.path.basename(path), list(entries.values()))
+    except Exception as e:
+        print(f"Ошибка извлечения комментариев из {os.path.basename(path)}: {e}")
+        return _extract_xlsx_comments_openpyxl(path)
+
+
+def _get_or_convert_xls(file_path):
+    """Конвертирует бинарный .xls в .xlsx через Excel COM с mtime-кэшем (.cache/converted_xls).
+
+    Кэш-ключ содержит md5 полного пути (коллизии одинаковых имён из разных папок);
+    свежий кэш (mtime кэша >= mtime оригинала) переиспользуется без запуска Excel.
+    Возвращает путь к кэш-конверсии или None при сбое (Excel не установлен, пароль, битый файл).
+    COM-инициализация самодостаточна (парный CoInitialize/CoUninitialize) — вложенность
+    в поток load_files_bg легальна (прецедент safe_read_old_word_file).
+    """
+    try:
+        cache_dir = os.path.join(get_base_path(), ".cache", "converted_xls")
+        abs_path = os.path.abspath(file_path)
+        cache_key = hashlib.md5(abs_path.encode("utf-8", "ignore")).hexdigest()[:8]
+        cache_name = f"{_norm_filename(os.path.splitext(os.path.basename(file_path))[0])}_{cache_key}.xlsx"
+        cache_path = os.path.join(cache_dir, cache_name)
+
+        if os.path.exists(cache_path):
+            try:
+                if os.path.getmtime(cache_path) >= os.path.getmtime(file_path):
+                    return cache_path
+            except OSError:
+                pass
+
+        os.makedirs(cache_dir, exist_ok=True)
+        unique_id = uuid.uuid4().hex
+        temp_input = os.path.normpath(os.path.join(tempfile.gettempdir(), f"temp_in_{unique_id}.xls"))
+        # Промежуточное имя в том же каталоге (атомарный os.replace), с расширением .xlsx для Excel
+        cache_tmp = os.path.join(cache_dir, f".tmp_{unique_id}_{cache_name}")
+
+        try:
+            shutil.copy2(file_path, temp_input)
+        except Exception as copy_err:
+            print(f"Не удалось скопировать {os.path.basename(file_path)} во временную папку для конвертации: {copy_err}")
+            try:
+                if os.path.exists(temp_input):
+                    os.remove(temp_input)
+            except Exception:
+                pass
+            return None
+
+        excel = None
+        wb = None
+        pythoncom.CoInitialize()
+        try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = 0
+            try:
+                excel.AutomationSecurity = 3  # msoAutomationSecurityForceDisable: без макро-диалогов
+            except Exception:
+                pass
+            wb = excel.Workbooks.Open(temp_input, 0, True)  # (FileName, UpdateLinks=0, ReadOnly=True)
+            wb.SaveAs(cache_tmp, 51)  # 51 = xlOpenXMLWorkbook (.xlsx)
+            wb.Close(False)
+            wb = None
+            os.replace(cache_tmp, cache_path)  # атомарная подмена кэша
+            return cache_path
+        except Exception as com_err:
+            print(f"Ошибка конвертации {os.path.basename(file_path)} (.xls → .xlsx): {com_err}")
+            return None
+        finally:
+            if wb is not None:
+                try:
+                    wb.Close(False)
+                except Exception:
+                    pass
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+            pythoncom.CoUninitialize()
+            for p in (temp_input, cache_tmp):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception as ce:
+                    print(f"Не удалось удалить временный файл {p}: {ce}")
+    except Exception as e:
+        print(f"Ошибка подготовки конвертации {os.path.basename(file_path)} (.xls → .xlsx): {e}")
+        return None
+
+
 def extract_text_from_pdf(filepath):
     """Извлекает текст из PDF-документа с текстовым слоем."""
     try:
@@ -659,22 +1175,32 @@ def extract_smart_vision_and_pdf(filepath):
 
         cache_dir = os.path.join(get_base_path(), ".cache")
         os.makedirs(cache_dir, exist_ok=True)
-        name_without_ext = os.path.splitext(filename)[0]
-        
-        # ИСПОЛЬЗУЕМ ABSPATH ДЛЯ ЗАЩИТЫ ОТ ОШИБКИ КРОСС-ДИСКОВЫХ ПУТЕЙ (WINDOWS)
-        abs_path = os.path.abspath(filepath)
-        path_hash = hashlib.md5(abs_path.encode('utf-8')).hexdigest()[:6]
-        cache_path = os.path.join(cache_dir, f"{name_without_ext}_{path_hash}_vision.md")
+        # Единая точка расчёта пути кэша (используется и в XWiki fast-path)
+        cache_path = _vision_cache_path(filepath)
 
+        # КРИТИЧЕСКИЙ ФИКС: Для файлов XWiki (где имя = MD5-хэш) доверяем кэшу вслепую.
+        # Для остальных файлов (PDF, Word и т.д.) проверяем дату изменения (mtime).
+        cache_fresh_text = None
         if os.path.exists(cache_path):
             try:
-                # КРИТИЧЕСКИЙ ФИКС: Для файлов XWiki (где имя = MD5-хэш) доверяем кэшу вслепую.
-                # Для остальных файлов (PDF, Word и т.д.) проверяем дату изменения (mtime).
                 if "xwiki_sync" in filepath.lower() or os.path.getmtime(cache_path) >= os.path.getmtime(filepath):
                     with open(cache_path, "r", encoding="utf-8") as f:
-                        return f.read()
+                        cached_text = f.read()
+                    if "[Ошибка Vision API" in cached_text:
+                        # Самолечение: legacy-кэш, отравленный текстом ошибки, считаем отсутствующим
+                        log_core.warning("Vision-кэш %s отравлен текстом ошибки API — удаляю и распознаю заново", os.path.basename(cache_path))
+                        try:
+                            os.remove(cache_path)
+                        except Exception:
+                            pass
+                    else:
+                        cache_fresh_text = cached_text
             except Exception:
-                pass
+                cache_fresh_text = None
+
+        # Полный кэш-хит для изображений; для PDF решение принимает постраничная логика ниже
+        if cache_fresh_text is not None and not ext.endswith(".pdf"):
+            return cache_fresh_text
 
         settings = load_global_settings()
         vision_model = settings.get("vision_model", "openai/gpt-4o-mini")
@@ -684,44 +1210,74 @@ def extract_smart_vision_and_pdf(filepath):
         openrouter_key = vault_data.get("openrouter_key", "").strip() or os.getenv("OPENROUTER_API_KEY", "")
 
         def call_vision_api(base64_image):
+            """Единый вызов Vision API. Сбой -> raise VisionAPIError: текст ошибки
+            НИКОГДА не возвращается как распознанный текст и не попадает в кэш.
+            Транзиентные сбои (429/таймаут/5xx) ретраятся один раз с паузой 5 с."""
             if not openrouter_key:
-                return "[Ошибка Vision API: не задан OPENROUTER_API_KEY]"
-            try:
-                system_prompt = (
-                    "Ты системный аналитик и продвинутый OCR. Перед тобой страница документа, "
-                    "презентации или схемы. Твоя задача:\n"
-                    "1. Извлечь весь читаемый текст.\n"
-                    "2. Если это блок-схема — опиши логику связей словами (что откуда куда идет).\n"
-                    "3. Если таблица — выведи ее в формате Markdown.\n"
-                    "Выводи только полезный текст, без лишних вступлений."
-                )
-                response = get_llm_client().chat.completions.create(
-                    model=vision_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
-                            ]
-                        }
+                raise VisionAPIError("Не задан OPENROUTER_API_KEY", kind="NO_KEY")
+            system_prompt = (
+                "Ты системный аналитик и продвинутый OCR. Перед тобой страница документа, "
+                "презентации или схемы. Твоя задача:\n"
+                "1. Извлечь весь читаемый текст.\n"
+                "2. Если это блок-схема — опиши логику связей словами (что откуда куда идет).\n"
+                "3. Если таблица — выведи ее в формате Markdown.\n"
+                "Выводи только полезный текст, без лишних вступлений."
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
                     ]
-                )
-                return response.choices[0].message.content or ""
+                }
+            ]
+
+            def _create_request():
+                return get_llm_client().chat.completions.create(model=vision_model, messages=messages)
+
+            try:
+                response = _create_request()
             except Exception as e:
-                return f"[Ошибка Vision API: {str(e)}]"
+                kind = _classify_net_error(e)
+                if kind in ("RATE_LIMIT_429", "TIMEOUT", "SERVER_5XX"):
+                    # Транзиентный сбой: одна повторная попытка с паузой
+                    time.sleep(5)
+                    try:
+                        response = _create_request()
+                    except Exception as e2:
+                        raise VisionAPIError(str(e2), kind=_classify_net_error(e2)) from e2
+                else:
+                    raise VisionAPIError(str(e), kind=kind) from e
+            # Пустой ответ модели — легитимный УСПЕХ (пустые страницы сканов):
+            # OpenRouter сообщает об ошибках HTTP-кодами, а не пустым 200.
+            return response.choices[0].message.content or ""
 
         final_text_blocks = []
         force_vision = "vis_index" in filename.lower()
 
         if ext.endswith((".png", ".jpg", ".jpeg")):
+            # При разомкнутой цепи сбоев — сразу отказ без обращения к API
+            if _VISION_CIRCUIT["open"]:
+                raise VisionAPIError("Vision OCR остановлен: цепь сбоев разомкнута", kind="CIRCUIT_OPEN")
             with open(filepath, "rb") as img_file:
                 b64_str = base64.b64encode(img_file.read()).decode("utf-8")
-            vision_text = call_vision_api(b64_str)
+            try:
+                vision_text = call_vision_api(b64_str)
+            except VisionAPIError as ve:
+                # Сбой: в кэш ничего не пишем, регистрируем в цепи и пробрасываем вызывающему
+                _vision_circuit_register(ve.kind)
+                raise
+            _vision_circuit_reset()
             final_text_blocks.append(f"--- РАСПОЗНАНО ИЗ {filename} ---\n{vision_text}")
         elif ext.endswith(".pdf"):
             doc = fitz.open(filepath)
             try:
+                # Постраничный кэш: из свежего кэша берём уже выполненные страницы (экономия токенов)
+                done_pages = _parse_vision_page_markers(cache_fresh_text) if cache_fresh_text is not None else {}
+                page_blocks = {}
+                failed_pages = []
+                pdf_fail_kind = None
                 for page_num in range(len(doc)):
                     page = doc.load_page(page_num)
                     native_text = page.get_text("text").strip()
@@ -759,14 +1315,49 @@ def extract_smart_vision_and_pdf(filepath):
                             route_to_vision = True
 
                     if route_to_vision:
+                        # Уже распознанная страница берётся из кэша без вызова API
+                        if (page_num + 1) in done_pages:
+                            page_blocks[page_num] = done_pages[page_num + 1]
+                            continue
+                        # Разомкнутая цепь: страницу помечаем упавшей без вызова API
+                        if _VISION_CIRCUIT["open"]:
+                            failed_pages.append(page_num + 1)
+                            pdf_fail_kind = pdf_fail_kind or "CIRCUIT_OPEN"
+                            continue
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                         b64_str = base64.b64encode(pix.tobytes("png")).decode("utf-8")
-                        vision_text = call_vision_api(b64_str)
-                        final_text_blocks.append(f"--- Страница {page_num + 1} (Vision OCR) ---\n{vision_text}\n")
+                        try:
+                            vision_text = call_vision_api(b64_str)
+                        except VisionAPIError as ve:
+                            # Сбой страницы: номер в список упавших, текст ошибки в кэш не попадает
+                            _vision_circuit_register(ve.kind)
+                            failed_pages.append(page_num + 1)
+                            pdf_fail_kind = ve.kind
+                            continue
+                        _vision_circuit_reset()
+                        page_blocks[page_num] = f"--- Страница {page_num + 1} (Vision OCR) ---\n{vision_text}\n"
                     else:
-                        final_text_blocks.append(f"--- Страница {page_num + 1} (Native Text) ---\n{native_text}\n")
+                        # Native-страницы «бесплатные»: всегда извлекаются заново локально
+                        page_blocks[page_num] = f"--- Страница {page_num + 1} (Native Text) ---\n{native_text}\n"
             finally:
                 doc.close()
+
+            if failed_pages:
+                # Прогресс сохраняется: кэш перезаписывается ТОЛЬКО успешными страницами.
+                # Текст ошибки Vision в кэш не пишется никогда.
+                ok_blocks = [page_blocks[i] for i in sorted(page_blocks)]
+                partial_text = "\n".join(ok_blocks) if ok_blocks else None
+                if ok_blocks:
+                    with open(cache_path, "w", encoding="utf-8") as f:
+                        f.write(partial_text)
+                raise VisionAPIError(
+                    f"Vision OCR не завершён: страницы {failed_pages} не распознаны",
+                    kind=pdf_fail_kind or "UNKNOWN",
+                    failed_pages=failed_pages,
+                    partial_text=partial_text,
+                )
+            # Все страницы готовы: собираем по порядку и идём в общий путь записи кэша
+            final_text_blocks = [page_blocks[i] for i in sorted(page_blocks)]
         else:
             return "Ошибка: extract_smart_vision_and_pdf поддерживает только .pdf/.png/.jpg/.jpeg"
 
@@ -774,10 +1365,32 @@ def extract_smart_vision_and_pdf(filepath):
         with open(cache_path, "w", encoding="utf-8") as f:
             f.write(full_text)
         return full_text
+    except VisionAPIError:
+        # Сбой Vision API пробрасывается вызывающему коду — как исключение, а не строка-ошибка
+        raise
     except Exception as e:
+        # Не-API сбои (fitz и т.п.): строка начинается с «Ошибка», индексатор её пропустит; кэш не пишется
         return f"Ошибка smart vision/parsing: {str(e)}"
 
-def process_xwiki_attachments(html_text, page_url, auth, app_instance=None):
+def _is_login_page_content(data, filename):
+    """Детектор «HTML-страницы входа под видом вложения» (D-2026-09-20-03):
+    сбой аутентификации при скачивании сохраняет форму логина портала (sph_* /
+    password-поле) в файл не-HTML расширения (.png/.doc/...) — такой мусор потом
+    вечно не читается Vision/Word и не лечится sync-ом (файл уже существует).
+    True только когда файл ПОХОЖ на HTML И содержит маркер логина; легитимные
+    .html/.htm/.txt-вложения не считаются страницей входа."""
+    try:
+        ext = os.path.splitext(str(filename))[1].lower()
+        if ext in ('.html', '.htm', '.mht', '.mhtml', '.txt', '.md', '.xml', '.svg'):
+            return False
+        head = bytes(data[:8192]).lower()
+        html_like = head.lstrip().startswith(b"<!doctype html") or head.lstrip().startswith(b"<html") or b"<html" in head[:256]
+        login_marker = (b"password" in head) or (b"sph_" in head) or (b"j_username" in head)
+        return html_like and login_marker
+    except Exception:
+        return False
+
+def process_xwiki_attachments(html_text, page_url, session):
     """
     Парсит HTML страницы XWiki, находит вложения, скачивает их (с проверкой кэша)
     и подменяет HTML-теги на текстовые якоря для RAG.
@@ -785,8 +1398,8 @@ def process_xwiki_attachments(html_text, page_url, auth, app_instance=None):
     Args:
         html_text: HTML контент страницы XWiki
         page_url: URL страницы (для разрешения относительных ссылок)
-        auth: HTTPBasicAuth для аутентификации
-        app_instance: Опционально, экземпляр GUI для отображения прогресса
+        session: requests.Session с trust_env=False (прямой доступ, минуя прокси —
+                 иммунитет к гонке env), verify=False, Basic-auth и cookie form-логина
     
     Returns:
         tuple: (Модифицированный HTML с заменёнными тегами вложений, список имён валидных файлов вложений)
@@ -800,7 +1413,7 @@ def process_xwiki_attachments(html_text, page_url, auth, app_instance=None):
     soup = BeautifulSoup(html_text, 'html.parser')
     links = soup.find_all('a', href=True)
     
-    downloaded_files = set()  # Для предотвращения дублей на одной странице
+    failed_files = set()  # Неудачные вложения этой страницы: дубли ссылки не качаем повторно
     valid_attachment_names = []  # Список всех валидных имён вложений для белого списка GC
     
     for a_tag in links:
@@ -820,37 +1433,117 @@ def process_xwiki_attachments(html_text, page_url, auth, app_instance=None):
             # Генерируем хэш от ПОЛНОГО URL (включая ?rev=...), чтобы отслеживать версии
             file_hash = hashlib.md5(full_download_url.encode('utf-8')).hexdigest()[:8]
             safe_filename = f"{file_hash}_{original_filename}"
-            valid_attachment_names.append(safe_filename)
             save_path = os.path.join(attachments_dir, safe_filename)
             
-            # Скачиваем файл, если его ещё нет на диске и мы его не качали в этой сессии
-            if not os.path.exists(save_path) and safe_filename not in downloaded_files:
+            # Самолечение: ранее скачанный файл может оказаться HTML-страницей входа
+            # (сбой аутентификации до фикса) — удаляем, чтобы перекачать прямо сейчас (D-2026-09-20-03)
+            if os.path.exists(save_path):
                 try:
-                    if app_instance and hasattr(app_instance, 'file_progress_label'):
-                        app_instance.file_progress_label.configure(
-                            text=f"Скачивание: {original_filename[:15]}..."
-                        )
+                    with open(save_path, 'rb') as _f_existing:
+                        _existing_head = _f_existing.read(8192)
+                    if _is_login_page_content(_existing_head, original_filename):
+                        os.remove(save_path)
+                        log_xwiki.warning("XWiki: вложение %s было сохранено как HTML-страница входа — удалено, перекачивается заново", safe_filename)
+                except OSError as _heal_err:
+                    log_xwiki.warning("XWiki: самолечение вложения %s не удалось (%s)", safe_filename, _heal_err)
+
+            # Скачиваем файл, если его ещё нет на диске и он не провалился ранее на этой странице
+            if not os.path.exists(save_path) and safe_filename not in failed_files:
+                try:
+                    file_resp = None
+                    for attempt in range(2):
+                        try:
+                            file_resp = session.get(full_download_url, timeout=60)
+                            file_resp.raise_for_status()
+                            break
+                        except Exception as dl_err:
+                            if attempt == 1:
+                                raise
+                            log_xwiki.warning("XWiki: вложение %s: попытка %d не удалась (%s) — повтор через 3 с",
+                                              original_filename, attempt + 1, _classify_net_error(dl_err))
+                            time.sleep(3)
                     
-                    file_resp = requests.get(full_download_url, auth=auth, verify=False)
-                    file_resp.raise_for_status()
-                    
+                    if _is_login_page_content(file_resp.content, original_filename):
+                        raise RuntimeError("получена HTML-страница входа вместо файла вложения")
                     with open(save_path, 'wb') as f:
                         f.write(file_resp.content)
-                    downloaded_files.add(safe_filename)
-                    
-                    if app_instance and hasattr(app_instance, 'file_progress_label'):
-                        app_instance.file_progress_label.configure(text="Готово")
                         
                 except Exception as e:
-                    print(f"Ошибка скачивания вложения {original_filename}: {e}")
-                    continue
+                    log_xwiki.warning("XWiki: вложение %s не скачано (%s) — страница %s",
+                                      original_filename, _classify_net_error(e), page_url)
+                    failed_files.add(safe_filename)
             
-            # Подменяем HTML-тег на якорь
-            # Оборачиваем в строку, которую markdownify не удалит
-            anchor_text = f"[Вложение: {safe_filename}]"
+            # Якорь только при наличии файла на диске; иначе — пометка вместо битой ссылки
+            if os.path.exists(save_path):
+                if safe_filename not in valid_attachment_names:
+                    valid_attachment_names.append(safe_filename)
+                anchor_text = f"[Вложение: {safe_filename}]"
+            else:
+                anchor_text = f"[Вложение недоступно: {original_filename}]"
             a_tag.replace_with(anchor_text)
     
     return str(soup), valid_attachment_names
+
+def _xwiki_form_login(session, page_url, login, password):
+    """Форм-логин в XWiki: Basic-auth сервер игнорирует на /view/ страницах. Форма входа
+    — корпоративный портал с НЕСТАНДАРТНЫМИ полями (sph_username/sph_password, скрытый
+    sph_org_location, action с токеном в пути), поэтому работаем GENERIC: ищем форму
+    с input[type=password], подставляем логин/пароль по ТИПАМ полей (скрытые значения
+    сохраняем как есть), POST на её action. Cookie остаётся в session — дальнейшие
+    GET-ы идут под пользователем. Возвращает True, если после входа форма входа
+    больше не показывается. Сетевые сбои — 3 попытки (вики отвечает медленно)."""
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = session.get(page_url, timeout=60)
+            break
+        except Exception as retry_err:
+            if attempt == 2:
+                log_xwiki.warning("XWiki: form-вход: страница %s недоступна (%s) — вход не выполнен",
+                                  page_url, _classify_net_error(retry_err))
+                return False
+            log_xwiki.warning("XWiki: form-вход: попытка %d не удалась (%s) — повтор через 5 с",
+                              attempt + 1, _classify_net_error(retry_err))
+            time.sleep(5)
+    resp.encoding = "utf-8"  # сервер не отдаёт charset — без этого resp.text даёт mojibake
+    soup = BeautifulSoup(resp.text, "html.parser")
+    form = None
+    for f in soup.find_all("form"):
+        if f.find("input", {"type": "password"}):
+            form = f
+            break
+    if form is None:
+        return False  # формы входа нет: Basic-auth сработал или открытый доступ
+    action = urljoin(page_url, form.get("action") or page_url)
+    payload = {}
+    for inp in form.find_all("input"):
+        name = inp.get("name")
+        if not name:
+            continue  # кнопка submit без имени
+        itype = (inp.get("type") or "text").lower()
+        if itype == "text":
+            payload[name] = login
+        elif itype == "password":
+            payload[name] = password
+        elif itype == "checkbox":
+            # «Сменить пароль» и прочие флаги — не отмечаем, если в HTML не отмечены
+            if inp.get("checked"):
+                payload[name] = inp.get("value", "on")
+        elif itype not in ("submit", "button", "reset", "file"):
+            payload[name] = inp.get("value", "")
+    try:
+        session.post(action, data=payload, timeout=60)
+    except Exception as post_err:
+        log_xwiki.warning("XWiki: form-вход: ошибка POST (%s) — остаёмся на Basic-auth", _classify_net_error(post_err))
+        return False
+    # Верификация: повторно открываем страницу — формы входа быть не должно
+    try:
+        check = session.get(page_url, timeout=60)
+        check.encoding = "utf-8"
+        check_soup = BeautifulSoup(check.text, "html.parser")
+        return check_soup.find("input", {"type": "password"}) is None
+    except Exception:
+        return False
 
 def sync_xwiki(app_instance=None):
     """
@@ -902,10 +1595,30 @@ def sync_xwiki(app_instance=None):
             except:
                 states = {}
 
+        # Новый цикл синхронизации: цепь сбоев Vision начинает с чистого состояния
+        _vision_circuit_reset()
+        # Карта имен inline-иллюстраций, собирается за синк и сохраняется в finally (D-2026-09-20-04)
+        image_name_map = {}
+
         # Создание единой сессии
         session = requests.Session()
         session.auth = HTTPBasicAuth(login, password)
         session.verify = False
+        # Внутренняя вики НЕ должна ходить через SOCKS-прокси: прокси ставится в env
+        # для OpenRouter (_configure_proxy_env), но requests-сессия по trust_env=True
+        # неявно его подхватывает — портал вики на прокси-трафик отдаёт свою форму
+        # аутентификации (site_publishing_helper). Прямой доступ проверен — работает.
+        session.trust_env = False
+
+        # Form-вход: Basic-auth XWiki на /view/ страницах игнорирует — качается форма логина.
+        # Логинимся формой; cookie-сессия после этого даёт доступ к реальному контенту.
+        try:
+            if _xwiki_form_login(session, xwiki_urls[0], login, password):
+                log_xwiki.info("XWiki: form-вход выполнен — контент страниц будет доступен")
+            else:
+                log_xwiki.warning("XWiki: форма входа не найдена или вход не прошёл — остаёмся на Basic-auth")
+        except Exception as e:
+            log_xwiki.warning("XWiki: form-вход не удался (%s) — остаёмся на Basic-auth", e)
 
         # ШАГ 2: JSTree Discovery (Поиск всех ID в базе)
         all_fullnames = set()
@@ -920,11 +1633,23 @@ def sync_xwiki(app_instance=None):
 
         for url in xwiki_urls:
             try:
-                # Получаем HTML страницы
-                resp = session.get(url, timeout=60)
+                # Получаем HTML страницы; 2 повтора при сетевом сбое — медленные ответы
+                # вики через SOCKS-прокси не должны терять целый раздел из очереди
+                resp = None
+                for attempt in range(3):
+                    try:
+                        resp = session.get(url, timeout=60)
+                        break
+                    except Exception as retry_err:
+                        if attempt == 2:
+                            raise
+                        log_xwiki.warning("XWiki: JSTree discovery %s: попытка %d не удалась (%s) — повтор через 5 с",
+                                          url, attempt + 1, _classify_net_error(retry_err))
+                        time.sleep(5)
                 if resp.status_code != 200:
                     log_xwiki.warning("XWiki: ошибка загрузки %s: HTTP %s", url, resp.status_code)
                     continue
+                resp.encoding = "utf-8"  # сервер не отдаёт charset — фикс mojibake в кэше
 
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 html_tag = soup.find("html")
@@ -1034,6 +1759,7 @@ def sync_xwiki(app_instance=None):
         processed_count = 0
         active_urls = set() # Журнал всех актуальных и проверенных ссылок
         active_images = set() # Журнал всех актуальных картинок (attachments)
+        vision_circuit_ui_notified = False # Сообщение о недоступности Vision OCR в UI — однократно за синк
 
         while queue_urls:
             current_url = queue_urls.pop(0)
@@ -1054,6 +1780,7 @@ def sync_xwiki(app_instance=None):
                 if resp.status_code != 200:
                     log_xwiki.warning("XWiki: ошибка скачивания %s: HTTP %s", current_url, resp.status_code)
                     continue
+                resp.encoding = "utf-8"  # сервер не отдаёт charset — фикс mojibake в кэше
 
                 soup = BeautifulSoup(resp.text, 'html.parser')
 
@@ -1062,6 +1789,18 @@ def sync_xwiki(app_instance=None):
                 if not content_block:
                     content_block = soup.find("body")
                 if not content_block:
+                    continue
+
+                # Защита от тихого мусора: если аутентификация не прошла, портал/XWiki отдаёт
+                # форму входа вместо контента (поля могут быть sph_username или j_username,
+                # поэтому ловим по типу password-поля) — индексировать её нельзя (мусор в
+                # базе, Smart Delta Cache вечно «свежая» из-за меняющихся токенов формы)
+                _cb_text = " ".join(content_block.get_text().split())
+                if content_block.find("input", {"type": "password"}) \
+                        or content_block.find("input", {"name": "j_username"}) \
+                        or "Необходима авторизация" in _cb_text:
+                    log_xwiki.error("XWiki: получена страница входа вместо содержимого %s — "
+                                    "аутентификация не прошла, проверьте логин/пароль в настройках", current_url)
                     continue
 
                 # Web Spider: ищем ссылки внутри контента
@@ -1085,6 +1824,9 @@ def sync_xwiki(app_instance=None):
                     active_urls.add(current_url) # Регистрация в журнале
                     
                     # --- КРИТИЧЕСКИЙ ФИКС: Защищаем картинки неизмененной страницы ---
+                    # Самолечение fast-path: у каждой Vision-картинки страницы должен быть кэш.
+                    # Если кэша нет (прошлый сбой OCR) — страницу не пропускаем, проваливаемся в полный цикл.
+                    all_vision_cached = True
                     for img in content_block.find_all('img'):
                         src = img.get('src', '')
                         if src:
@@ -1096,9 +1838,14 @@ def sync_xwiki(app_instance=None):
                             if not ext or len(ext) > 5: ext = '.jpg'
                             img_name = hashlib.md5(src.encode('utf-8')).hexdigest() + ext
                             active_images.add(img_name)
+                            # Прошлый сбой Vision: кэша нет -> доOCR-им в полном цикле (картинка уже скачана)
+                            if ext in ('.png', '.jpg', '.jpeg') and not os.path.exists(_vision_cache_path(os.path.join(attachments_dir, img_name))):
+                                all_vision_cached = False
                     # -----------------------------------------------------------------
                     
                     # --- Защищаем вложения неизмененной страницы ---
+                    # Отсутствие файла вложения (прошлый сбой скачивания) тоже проваливает
+                    # страницу в полный цикл (до-скачивание), как и отсутствие Vision-кэша.
                     for a_tag in content_block.find_all('a', href=True):
                         a_href = a_tag.get('href', '')
                         if '/download/' in a_href.lower() or 'attachment' in a_href.lower():
@@ -1108,10 +1855,21 @@ def sync_xwiki(app_instance=None):
                             if orig_fname:
                                 f_hash = hashlib.md5(full_dl_url.encode('utf-8')).hexdigest()[:8]
                                 active_images.add(f"{f_hash}_{orig_fname}")
+                                att_file_path = os.path.join(attachments_dir, f"{f_hash}_{orig_fname}")
+                                if not os.path.exists(att_file_path):
+                                    all_vision_cached = False
+                                elif _is_login_page_content(open(att_file_path, 'rb').read(8192), orig_fname):
+                                    # Файл есть, но это HTML-страница входа (сбой прошлого скачивания) —
+                                    # проваливаем страницу в полный цикл: process_xwiki_attachments удалит
+                                    # мусор и перекачает вложение (D-2026-09-20-03)
+                                    log_xwiki.warning("XWiki: fast-path: вложение %s — HTML-страница входа вместо файла, требуется перекачка", f"{f_hash}_{orig_fname}")
+                                    all_vision_cached = False
                     # -----------------------------------------------------------------
                     
-                    processed_count += 1
-                    continue
+                    if all_vision_cached:
+                        processed_count += 1
+                        continue
+                    # Иначе: полное перестроение страницы — доOCR-ятся только отсутствующие кэши
 
                 # Vision Pipeline
                 content_copy = BeautifulSoup(str(content_block), 'html.parser')
@@ -1136,13 +1894,34 @@ def sync_xwiki(app_instance=None):
                             ext = ".jpg"
                         img_name = hashlib.md5(src.encode()).hexdigest() + ext
                         active_images.add(img_name) # Регистрация картинки в журнале
+                        # Карта имен: md5-файл -> оригинальное имя картинки из URL (для локатора по имени)
+                        try:
+                            _orig_img_name = unquote(os.path.basename(urlparse(src).path))
+                            if _orig_img_name:
+                                image_name_map[img_name] = _orig_img_name
+                        except Exception:
+                            pass
                         img_path = os.path.join(attachments_dir, img_name)
+
+                        # Самолечение: картинка, скачанная ранее как HTML-страница входа, удалится и перекачается (D-2026-09-20-03)
+                        if os.path.exists(img_path):
+                            try:
+                                with open(img_path, 'rb') as _f_img:
+                                    _img_head = _f_img.read(8192)
+                                if _is_login_page_content(_img_head, img_name):
+                                    os.remove(img_path)
+                                    log_xwiki.warning("XWiki: картинка %s была сохранена как HTML-страница входа — удалена, перекачивается заново", img_name)
+                            except OSError as _heal_err:
+                                log_xwiki.warning("XWiki: самолечение картинки %s не удалось (%s)", img_name, _heal_err)
 
                         # Скачиваем только если картинки ещё нет
                         if not os.path.exists(img_path):
                             try:
                                 img_resp = session.get(src, timeout=30)
                                 if img_resp.status_code == 200:
+                                    if _is_login_page_content(img_resp.content, img_name):
+                                        log_xwiki.warning("XWiki: для картинки %s получена HTML-страница входа вместо файла — скачивание отложено", img_name)
+                                        continue
                                     with open(img_path, 'wb') as f:
                                         f.write(img_resp.content)
                             except Exception as e:
@@ -1151,7 +1930,18 @@ def sync_xwiki(app_instance=None):
 
                         # Вызов Vision только если картинка существует
                         if os.path.exists(img_path):
-                            vision_text = extract_smart_vision_and_pdf(img_path)
+                            try:
+                                vision_text = extract_smart_vision_and_pdf(img_path)
+                            except VisionAPIError as ve:
+                                # Сбой Vision API: в markdown страницы ничего не вставляем (мусор не индексируется)
+                                log_xwiki.warning("XWiki: сбой Vision OCR для %s (kind=%s): %s", img_name, ve.kind, ve)
+                                if _VISION_CIRCUIT["open"] and app_instance is not None and not vision_circuit_ui_notified:
+                                    # Однократное сообщение в UI за синк при размыкании цепи
+                                    vision_circuit_ui_notified = True
+                                    circuit_kind = _VISION_CIRCUIT.get("kind") or ve.kind
+                                    app_instance.after(0, lambda k=circuit_kind: update_xwiki_progress(
+                                        app_instance, f"⚠️ Vision OCR недоступен ({k}) — проверьте прокси/ключ; распознавание отложено"))
+                                continue
 
                             # Заменяем тег img на текст с упоминанием имени файла
                             img.replace_with(BeautifulSoup(
@@ -1159,8 +1949,8 @@ def sync_xwiki(app_instance=None):
                     except Exception as e:
                         log_xwiki.warning("XWiki: ошибка Vision для %s: %s", src, e)
 
-                # Обработка вложений XWiki (скачивание и подмена ссылок на якоря)
-                processed_html, current_page_attachments = process_xwiki_attachments(str(content_copy), current_url, session.auth, app_instance)
+                # Обработка вложений XWiki (скачивание через сессию и подмена ссылок на якоря)
+                processed_html, current_page_attachments = process_xwiki_attachments(str(content_copy), current_url, session)
                 active_images.update(current_page_attachments)
 
                 # Markdown и Сохранение
@@ -1202,36 +1992,52 @@ def sync_xwiki(app_instance=None):
                 continue
 
         # --- СБОРЩИК МУСОРА (Garbage Collector) ---
-        # 1. Удаляем физические файлы (.md), которых больше нет в активном журнале
-        valid_md5_names = {hashlib.md5(url.encode('utf-8')).hexdigest() + ".md" for url in active_urls}
-        for filename in os.listdir(xwiki_dir):
-            if filename.endswith(".md") and filename not in valid_md5_names:
-                try:
-                    os.remove(os.path.join(xwiki_dir, filename))
-                except Exception:
-                    pass
-        
-        # 2. Удаляем осиротевшие картинки (attachments), которых больше нет в активном журнале
-        for filename in os.listdir(attachments_dir):
-            if filename not in active_images:
-                try:
-                    os.remove(os.path.join(attachments_dir, filename))
-                except Exception:
-                    pass
+        # Защита от массового уничтожения локального корпуса: если активный журнал пуст,
+        # а states — нет, значит синк не обработал ни одной страницы (сбой аутентификации
+        # или сети) и очистка стёрла бы весь кэш. Пропускаем GC — файлы и states не трогаем.
+        if not active_urls and states:
+            log_xwiki.error("XWiki: ни одна страница не обработана, но в states %d URL — "
+                            "сборщик мусора пропущен, локальный кэш сохранён "
+                            "(проверьте аутентификацию/сеть)", len(states))
+        else:
+            # 1. Удаляем физические файлы (.md), которых больше нет в активном журнале
+            valid_md5_names = {hashlib.md5(url.encode('utf-8')).hexdigest() + ".md" for url in active_urls}
+            for filename in os.listdir(xwiki_dir):
+                if filename.endswith(".md") and filename not in valid_md5_names:
+                    try:
+                        os.remove(os.path.join(xwiki_dir, filename))
+                    except Exception:
+                        pass
 
-        # 3. Очищаем сам словарь состояний (states) от старых ссылок
-        keys_to_delete = [url for url in states.keys() if url not in active_urls]
-        for url in keys_to_delete:
-            del states[url]
+            # 2. Удаляем осиротевшие картинки (attachments), которых больше нет в активном журнале
+            for filename in os.listdir(attachments_dir):
+                if filename not in active_images:
+                    try:
+                        os.remove(os.path.join(attachments_dir, filename))
+                    except Exception:
+                        pass
 
-        # Сохранение финального состояния
-        with open(states_file, 'w', encoding='utf-8') as f:
-            json.dump(states, f, ensure_ascii=False, indent=2)
+            # 3. Очищаем сам словарь состояний (states) от старых ссылок
+            keys_to_delete = [url for url in states.keys() if url not in active_urls]
+            for url in keys_to_delete:
+                del states[url]
+
+            # Сохранение финального состояния
+            with open(states_file, 'w', encoding='utf-8') as f:
+                json.dump(states, f, ensure_ascii=False, indent=2)
 
         log_xwiki.info("XWiki: синхронизация завершена. Обработано %d документов.", processed_count)
 
     except Exception as e:
         log_xwiki.error("XWiki: критическая ошибка синхронизации (%s): %s", _classify_net_error(e), e)
+    finally:
+        # Цепь сбоев Vision живёт только в рамках одной синхронизации
+        _vision_circuit_reset()
+        # Сохраняем карту имен иллюстраций (для поиска по оригинальному имени)
+        try:
+            _save_image_name_map(attachments_dir, image_name_map)
+        except Exception:
+            pass
 
 
 def update_xwiki_progress(app_instance, doc_name):
@@ -1436,11 +2242,15 @@ def extract_text_from_html_diagram(filepath):
         return f"Ошибка парсинга HTML-диаграммы: {str(e)}"
 
 
-def safe_read_old_word_file(file_path):
+def safe_read_old_word_file(file_path, return_comments=False):
     """
     Бронебойная песочница для чтения .doc и .rtf файлов.
     Решает проблему сетевых дисков (Z:) и локальных дисков (C:) путем 
     копирования файлов в локальную папку %TEMP% перед COM-конвертацией.
+
+    D-2026-09-20-05: при return_comments=True возвращает
+    (text, comments_count, comments_block|None) — комментарии снимаются
+    с temp-docx ДО его удаления в finally.
     """
     import os
     import tempfile
@@ -1461,6 +2271,8 @@ def safe_read_old_word_file(file_path):
     temp_output_path = os.path.normpath(os.path.join(temp_dir, f"temp_out_{unique_id}.docx"))
     
     text_content = ""
+    comments_count = 0
+    comments_block = None
     word = None
     doc = None
     com_text = ""
@@ -1500,6 +2312,12 @@ def safe_read_old_word_file(file_path):
         # 3. Читаем перекодированный .docx
         if os.path.exists(temp_output_path):
             parsed_raw = read_docx_with_indices(temp_output_path)
+            # Комментарии снимаем с temp-docx сейчас — ниже finally его удалит;
+            # paras из parsed_raw нужны для привязки комментариев к абзацам [i]
+            if return_comments:
+                comments_count, comments_block = _extract_docx_comments(
+                    temp_output_path,
+                    paras=parsed_raw[1] if isinstance(parsed_raw, tuple) else None)
             parsed_text = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
             
             if parsed_text and isinstance(parsed_text, str) and parsed_text.strip():
@@ -1523,6 +2341,8 @@ def safe_read_old_word_file(file_path):
         # Закрываем COM-поток
         pythoncom.CoUninitialize()
         
+    if return_comments:
+        return text_content, comments_count, comments_block
     return text_content
 
 _STT_NAME_PATTERNS = ("whisper", "parakeet", "asr", "transcribe", "tdt", "canary", "voxtral-mini-transcribe")
@@ -1746,8 +2566,120 @@ def convert_legacy_to_docx(input_path, output_path):
             except: pass
         pythoncom.CoUninitialize()
 
-def find_target_file(filename):
-    """Единый локатор файлов/папок с учетом настроек и black-list слов."""
+def _norm_filename(value):
+    """Канонизация имени файла для сравнений (D-2026-09-18-04):
+    NFC-нормализация Unicode (лечит NFD-имена, где «й» = «и»+U+0306),
+    схлопывание пробелов (хвостовые/двойные), регистр и «ё»→«е»."""
+    return unicodedata.normalize("NFC", " ".join(str(value).split())).casefold().replace("ё", "е")
+
+def _norm_filename_relaxed(value):
+    """Relaxed-канонизация для нечёткого сравнения имён (D-2026-09-20-02):
+    _norm_filename + удаление всего кроме букв/цифр (точки, «_», «-», пробелы)."""
+    base = _norm_filename(value)
+    return re.sub(r"[\W_]+", "", base, flags=re.UNICODE)
+
+def _tokens_match(qt, ct):
+    """Сравнение токенов имён для фолбэка «мигающих» вложений (D-2026-09-20-02):
+    совпадение при полном равенстве ИЛИ общем начале (lcp >= 3, отставание
+    не более 2 символов) — лечит морфологию «увольнение»/«увольнения»."""
+    if qt == ct:
+        return True
+    lcp = 0
+    for a, b in zip(qt, ct):
+        if a != b:
+            break
+        lcp += 1
+    return lcp >= 3 and lcp >= min(len(qt), len(ct)) - 2
+
+def _split_tokens(name):
+    """Токены имени для нечёткого поиска (D-2026-09-20-02): стем без финального
+    расширения -> _norm_filename -> split по пробелам -> края очищены от не-букв."""
+    stem = os.path.splitext(str(name))[0]
+    raw_tokens = _norm_filename(stem).split()
+    tokens = [re.sub(r"^\W+|\W+$", "", t) for t in raw_tokens]
+    return [t for t in tokens if t]
+
+def _strip_attach_hash_prefix(name):
+    """Имя вложения XWiki без префикса-хэша {8 hex}_ (если префикс есть)."""
+    m = re.match(r"^[0-9a-f]{8}_(.+)$", str(name), re.IGNORECASE)
+    return m.group(1) if m else str(name)
+
+def _suggest_similar_files(query, limit=5):
+    """Подсказки ближайших имён файлов после промаха локатора (D-2026-09-20-02):
+    difflib по relaxed-ключам по разрешенным директориям + кэш вложений XWiki."""
+    try:
+        candidates = set()
+        settings = load_global_settings()
+        folders = settings.get("indexed_folders", ["./SMK_Docs", "./Memory"])
+        xwiki_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync")
+        if os.path.exists(xwiki_dir) and xwiki_dir not in folders:
+            folders.append(xwiki_dir)
+        excludes = [k.lower() for k in settings.get("exclude_keywords", [])]
+
+        def has_excluded(text):
+            text_low = str(text).lower()
+            return any(k and k in text_low for k in excludes)
+
+        for folder in folders:
+            if not os.path.exists(folder):
+                continue
+            for root, dirs, files in os.walk(folder):
+                if 'attachments' in root.lower() or has_excluded(root):
+                    dirs[:] = []
+                    continue
+                if '.cache' in root.lower() and 'xwiki_sync' not in root.lower():
+                    dirs[:] = []
+                    continue
+                dirs[:] = [d for d in dirs if (not '.cache' in d.lower() or 'xwiki_sync' in d.lower()) and not has_excluded(d)]
+                for f in files:
+                    if '~$' in f or has_excluded(f):
+                        continue
+                    candidates.add(f)
+
+        attach_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync", "attachments")
+        if os.path.isdir(attach_dir):
+            for f in os.listdir(attach_dir):
+                if os.path.isfile(os.path.join(attach_dir, f)):
+                    candidates.add(_strip_attach_hash_prefix(f))
+            for _img_orig in _load_image_name_map().values():
+                candidates.add(_img_orig)
+
+        keys_map = {}
+        for c in candidates:
+            keys_map.setdefault(_norm_filename_relaxed(c), c)
+        close = difflib.get_close_matches(_norm_filename_relaxed(query), list(keys_map.keys()), n=limit, cutoff=0.7)
+        return [keys_map[k] for k in close]
+    except Exception:
+        return []
+
+def _load_image_name_map():
+    """Карта имен inline-иллюстраций XWiki: {hash-файл: оригинальное имя из URL} (D-2026-09-20-04).
+    Inline-картинки лежат в кэше под md5 от URL (оригинальное имя нигде не сохранялось),
+    из-за чего по имени «Пример диаграммы Ганта.png» их не найти; карта пишется синком."""
+    p = os.path.join(get_base_path(), ".cache", "xwiki_sync", "image_names.json")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_image_name_map(attachments_dir, new_map):
+    """Слияние и сохранение карты имен иллюстраций; записи для отсутствующих файлов отбрасываются."""
+    merged = _load_image_name_map()
+    merged.update(new_map or {})
+    merged = {k: v for k, v in merged.items() if os.path.isfile(os.path.join(attachments_dir, k))}
+    p = os.path.join(get_base_path(), ".cache", "xwiki_sync", "image_names.json")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+
+def find_target_file(filename, allow_fuzzy=False):
+    """Единый локатор файлов/папок с учетом настроек и black-list слов.
+    При allow_fuzzy=True после строгого сравнения (этап A) включается нечёткий
+    фолбэк (D-2026-09-20-02): B — сравнение без разделителей, C — токен-subset
+    (только единственный кандидат), D — difflib по relaxed-ключам. Любая
+    неоднозначность — None; файлы на диске не переименуются."""
     try:
         if os.path.isabs(filename) and os.path.exists(filename):
             return filename
@@ -1757,8 +2689,10 @@ def find_target_file(filename):
         xwiki_attach_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync", "attachments")
         
         if os.path.exists(xwiki_attach_dir):
+            norm_search = _norm_filename(clean_search_name)
             for f in os.listdir(xwiki_attach_dir):
-                if f == clean_search_name or f.endswith(f"_{clean_search_name}"):
+                norm_f = _norm_filename(f)
+                if norm_f == norm_search or norm_f.endswith(f"_{norm_search}"):
                     return os.path.join(xwiki_attach_dir, f)
         # -----------------------------------------------------------------------
 
@@ -1786,11 +2720,24 @@ def find_target_file(filename):
             expected_md5 = hashlib.md5(clean_url.encode('utf-8')).hexdigest() + ".md"
             target_name = expected_md5.lower()
         else:
-            target_name = os.path.basename(filename_str).lower()
+            target_name = _norm_filename(os.path.basename(filename_str))
 
         def has_excluded(text):
             text_low = str(text).lower()
             return any(k and k in text_low for k in excludes)
+
+        candidates = []
+        if allow_fuzzy:
+            fuzzy_attach_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync", "attachments")
+            if os.path.isdir(fuzzy_attach_dir):
+                for f in os.listdir(fuzzy_attach_dir):
+                    if os.path.isfile(os.path.join(fuzzy_attach_dir, f)):
+                        candidates.append((_strip_attach_hash_prefix(f), os.path.join(fuzzy_attach_dir, f)))
+            # Inline-иллюстрации лежат под md5-именем URL — карта возвращает им оригинальные имена
+            for _img_hash, _img_orig in _load_image_name_map().items():
+                _img_path = os.path.join(get_base_path(), ".cache", "xwiki_sync", "attachments", _img_hash)
+                if os.path.isfile(_img_path):
+                    candidates.append((_img_orig, _img_path))
 
         for folder in folders:
             if not os.path.exists(folder):
@@ -1801,7 +2748,6 @@ def find_target_file(filename):
                 if 'attachments' in root.lower():
                     dirs[:] = []
                     continue
-
                 # Игнорируем .cache, НО делаем исключение для подпапки xwiki_sync
                 if ('.cache' in root.lower() and 'xwiki_sync' not in root.lower()) or has_excluded(root):
                     dirs[:] = []
@@ -1810,24 +2756,92 @@ def find_target_file(filename):
                 dirs[:] = [d for d in dirs if (not '.cache' in d.lower() or 'xwiki_sync' in d.lower()) and not has_excluded(d)]
 
                 for d in dirs:
-                    if d.lower() == target_name:
+                    if _norm_filename(d) == target_name:
                         return os.path.join(root, d)
 
                 for f in files:
                     if has_excluded(f):
                         continue
-                    if f.lower() == target_name:
+                    if allow_fuzzy:
+                        candidates.append((f, os.path.join(root, f)))
+                    if _norm_filename(f) == target_name:
                         return os.path.join(root, f)
+
+        if not allow_fuzzy:
+            return None
+
+        # --- Нечеткий фолбэк по имени (D-2026-09-20-02): только однозначные совпадения ---
+        candidates = [(n, p) for i, (n, p) in enumerate(candidates)
+                      if _norm_filename_relaxed(n) not in {_norm_filename_relaxed(m) for m, _ in candidates[:i]}]
+        query_str = str(filename).strip()
+        if not query_str:
+            return None
+        if query_str.startswith("http"):
+            from urllib.parse import unquote
+            query_str = os.path.basename(unquote(query_str))
+        norm_query = _norm_filename(query_str)
+        req_ext = os.path.splitext(norm_query)[1]
+        relaxed_query = _norm_filename_relaxed(query_str)
+        query_tokens = [t for t in _split_tokens(query_str) if t]
+
+        def cand_ext(name):
+            return os.path.splitext(_norm_filename(name))[1]
+
+        def tokens_ok(display):
+            if req_ext and cand_ext(display) != req_ext:
+                return False
+            cand_tokens = [t for t in _split_tokens(os.path.splitext(str(display))[0]) if t]
+            return query_tokens and all(any(_tokens_match(q, c) for c in cand_tokens) for q in query_tokens)
+
+        stage_b = [(n, p) for (n, p) in candidates if _norm_filename_relaxed(n) == relaxed_query]
+        if len(stage_b) == 1:
+            return stage_b[0][1]
+
+        stage_c = [(n, p) for (n, p) in candidates if tokens_ok(n)]
+        if len(stage_c) == 1:
+            return stage_c[0][1]
+
+        if req_ext and not stage_c:
+            pairs = [(n, p, _norm_filename_relaxed(n)) for (n, p) in candidates if cand_ext(n) == req_ext]
+            close = difflib.get_close_matches(relaxed_query, [v for _, _, v in pairs], n=2, cutoff=0.85)
+            if close:
+                top = close[0]
+                ratio_top = difflib.SequenceMatcher(None, relaxed_query, top).ratio()
+                ratio_second = difflib.SequenceMatcher(None, relaxed_query, close[1]).ratio() if len(close) > 1 else 0.0
+                same_top = [(n, p) for n, p, v in pairs if v == top]
+                if len(same_top) == 1 and ratio_top - ratio_second >= 0.05:
+                    return same_top[0][1]
 
         return None
     except Exception:
         return None
 
 def read_local_file(filename):
+    from urllib.parse import unquote
+    try:
+        req_query = str(filename).strip()
+        req_base = os.path.basename(unquote(req_query)) if req_query.startswith("http") else str(filename)
+    except Exception:
+        req_base = str(filename)
     target_file = find_target_file(filename)
     if not target_file:
-        return f"Ошибка: Файл '{filename}' не найден в разрешенных директориях."
+        target_file = find_target_file(filename, allow_fuzzy=True)
+    if not target_file:
+        suggestions = _suggest_similar_files(req_base)
+        err = f"Ошибка: Файл '{filename}' не найден в разрешенных директориях."
+        if suggestions:
+            err += f" Ближайшие совпадения: {'; '.join(suggestions)}. Запустите list_available_files для полного списка."
+        return err
 
+    fuzzy_hit = _norm_filename(os.path.basename(target_file)) != _norm_filename(req_base)
+    result = _read_file_content_by_path(target_file, filename)
+    if fuzzy_hit and not str(result).startswith("Ошибка"):
+        actual_name = _load_image_name_map().get(os.path.basename(target_file)) \
+                      or _strip_attach_hash_prefix(os.path.basename(target_file))
+        result += f"\n[Система: файл прочитан как «{actual_name}» — используйте его в ссылках]"
+    return result
+
+def _read_file_content_by_path(target_file, filename):
     if os.path.isdir(target_file):
         allowed_exts = (
             '.docx', '.txt', '.md', '.pdf', '.png', '.jpg', '.jpeg',
@@ -1942,6 +2956,22 @@ def save_file_states(states):
         with open(file_states_path, 'w', encoding='utf-8') as f: json.dump(states, f, ensure_ascii=False, indent=2)
     except: pass
 
+def _keyword_matches_name(keyword, name):
+    """Матч ключевого слова против имени файла для list_available_files (D-2026-09-20-02):
+    базовый substring ИЛИ токен-сравнение через _tokens_match (морфология
+    «увольнение»/«увольнения»), по полному имени и по stem без расширения."""
+    norm_kw = _norm_filename(keyword)
+    if not norm_kw:
+        return False
+    norm_name = _norm_filename(name)
+    if norm_kw in norm_name or norm_kw in _norm_filename(os.path.splitext(str(name))[0]):
+        return True
+    kw_tokens = [t for t in _split_tokens(keyword) if t]
+    name_tokens = [t for t in _split_tokens(os.path.splitext(str(name))[0]) if t]
+    if not kw_tokens or not name_tokens:
+        return False
+    return all(any(_tokens_match(q, c) for c in name_tokens) for q in kw_tokens)
+
 def list_available_files(category="all", search_keyword=""):
     """Инструмент: Умный поиск и группировка проиндексированных файлов из file_states.json"""
     try:
@@ -1975,13 +3005,14 @@ def list_available_files(category="all", search_keyword=""):
 
         keyword = str(search_keyword).lower().strip()
         total_found = 0
+        seen_relaxed = set()
         
         for path in states.keys():
             ext = os.path.splitext(path)[1].lower()
             name = os.path.basename(path)
             
-            # Фильтр по ключевому слову в названии
-            if keyword and keyword not in name.lower():
+            # Фильтр по ключевому слову в названии (нечувствительно к морфологии, D-2026-09-20-02)
+            if keyword and not _keyword_matches_name(keyword, name):
                 continue
                 
             # Определяем категорию
@@ -1996,8 +3027,40 @@ def list_available_files(category="all", search_keyword=""):
                 continue
                 
             grouped_files[matched_cat].append(name)
+            seen_relaxed.add(_norm_filename_relaxed(name))
             total_found += 1
-            
+
+        # Второй источник: кэш вложений XWiki (в file_states их нет по дизайну сканера, D-2026-09-20-02)
+        attach_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync", "attachments")
+        image_map = _load_image_name_map()
+        if os.path.isdir(attach_dir):
+            for f in os.listdir(attach_dir):
+                if not os.path.isfile(os.path.join(attach_dir, f)):
+                    continue
+                if re.match(r"^[0-9a-f]{32}\.\w+$", f, re.IGNORECASE):
+                    # Inline-иллюстрация под md5-именем URL: показываем только с картой имен
+                    display = image_map.get(f)
+                    if not display:
+                        continue
+                else:
+                    display = _strip_attach_hash_prefix(f)
+                key = _norm_filename_relaxed(display)
+                if not key or key in seen_relaxed:
+                    continue
+                if keyword and not _keyword_matches_name(keyword, display):
+                    continue
+                ext = os.path.splitext(display)[1].lower()
+                matched_cat = "other"
+                for cat, exts in ext_map.items():
+                    if ext in exts:
+                        matched_cat = cat
+                        break
+                if category != "all" and matched_cat != category:
+                    continue
+                grouped_files[matched_cat].append(display)
+                seen_relaxed.add(key)
+                total_found += 1
+                
         if total_found == 0:
             msg = "В базе не найдено файлов."
             if category != "all": msg += f" Категория: '{category}'."
@@ -2021,6 +3084,236 @@ def list_available_files(category="all", search_keyword=""):
     except Exception as e:
         return f"Ошибка при получении списка файлов: {str(e)}"
 
+def _cleanup_poisoned_vision_cache(collection):
+    """Разовая миграционная очистка данных, отравленных текстом ошибки Vision API
+    («[Ошибка Vision API ...]») — наследие кода до VisionAPIError. Выполняется ОДИН раз
+    после обновления (флаг .cache/.poison_cleanup_done), а не при каждом синке: маркер
+    ищется подстрокой, поэтому постоянный запуск устроил бы вечный цикл «удалить →
+    перекачать → снова удалить» для любого легитимного документа, цитирующего маркер
+    (актуальный пайплайн текст ошибки в кэш не пишет вовсе).
+      1) .cache/*_vision.md с маркером -> удалить файл;
+      2) .cache/xwiki_sync/*.md с маркером -> удалить файл и URL страницы из xwiki_states.json
+         (иначе паук пропустит неизменённую страницу по хэшу и она навсегда исчезнет из индекса);
+      3) чанки Chroma с маркером -> удалить + стереть записи file_states.json пострадавших
+         файлов (свежим чтением/записью) — файлы переиндексируются на следующем синке.
+    Вся логика в try/except — сбой чистки не ломает синхронизацию; флаг пишется только
+    при успешно завершённом проходе (сбой -> чистка повторится на следующем синке)."""
+    marker = "[Ошибка Vision API"
+    done_flag = os.path.join(get_base_path(), ".cache", ".poison_cleanup_done")
+    if os.path.exists(done_flag):
+        return
+    try:
+        cache_dir = os.path.join(get_base_path(), ".cache")
+
+        # --- 1. Локальные vision-кэши ---
+        if os.path.isdir(cache_dir):
+            for fname in os.listdir(cache_dir):
+                if not fname.endswith("_vision.md"):
+                    continue
+                fpath = os.path.join(cache_dir, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        if marker in f.read():
+                            os.remove(fpath)
+                            log_sync.info("Очистка: удалён отравленный vision-кэш %s", fname)
+                except Exception:
+                    pass
+
+        # --- 2. XWiki md-страницы + состояния паука ---
+        xwiki_dir = os.path.join(cache_dir, "xwiki_sync")
+        if os.path.isdir(xwiki_dir):
+            states_file = os.path.join(xwiki_dir, "xwiki_states.json")
+            states = {}
+            if os.path.exists(states_file):
+                try:
+                    with open(states_file, 'r', encoding='utf-8') as f:
+                        states = json.load(f)
+                except Exception:
+                    states = {}
+            removed_urls = []
+            for fname in os.listdir(xwiki_dir):
+                if not fname.endswith(".md"):
+                    continue
+                fpath = os.path.join(xwiki_dir, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        text = f.read()
+                    if marker not in text:
+                        continue
+                    # URL парсим из заголовка «# Источник:» (regex как у индексатора)
+                    url_match = re.search(r'# Источник:\s*(https?://[^\n]+)', text)
+                    if url_match:
+                        removed_urls.append(url_match.group(1).strip())
+                    os.remove(fpath)
+                    log_sync.info("Очистка: удалена отравленная XWiki-страница %s", fname)
+                except Exception:
+                    pass
+            if removed_urls:
+                # Без удаления из states паук никогда не перекачает страницу заново
+                for url in removed_urls:
+                    states.pop(url, None)
+                try:
+                    with open(states_file, 'w', encoding='utf-8') as f:
+                        json.dump(states, f, ensure_ascii=False, indent=2)
+                except Exception as se:
+                    log_sync.warning("Очистка: не удалось обновить xwiki_states.json: %s", se)
+
+        # --- 3. Отравленные чанки в Chroma + file_states пострадавших файлов ---
+        try:
+            res = collection.get(where_document={"$contains": marker})
+            ids = res.get("ids") or []
+            if ids:
+                metas = res.get("metadatas") or []
+                affected = []
+                for m in metas:
+                    fp = (m or {}).get("file_path")
+                    if fp and fp not in affected:
+                        affected.append(fp)
+                collection.delete(ids=ids)
+                log_sync.info("Очистка: удалено %d отравленных чанков Chroma", len(ids))
+                if affected:
+                    # Свежее чтение/правка/запись file_states.json (до get_file_states синка)
+                    states_path = os.path.join(get_base_path(), "file_states.json")
+                    fs = {}
+                    if os.path.exists(states_path):
+                        try:
+                            with open(states_path, 'r', encoding='utf-8') as f:
+                                fs = json.load(f)
+                        except Exception:
+                            fs = {}
+                    changed = False
+                    for fp in affected:
+                        if fp in fs:
+                            del fs[fp]
+                            changed = True
+                    if changed:
+                        with open(states_path, 'w', encoding='utf-8') as f:
+                            json.dump(fs, f, ensure_ascii=False, indent=2)
+                        log_sync.info("Очистка: записи о %d пострадавших файлах стёрты из file_states.json (переиндексация)", len(affected))
+        except Exception as ce:
+            log_sync.warning("Очистка Chroma от отравленных чанков не выполнена: %s", ce)
+
+        # Флаг успешного разового прохода: миграционная чистка не повторяется на следующих синках
+        try:
+            with open(done_flag, "w", encoding="utf-8") as f:
+                f.write(datetime.now().isoformat())
+        except Exception as fe:
+            log_sync.warning("Очистка: не удалось записать флаг .poison_cleanup_done: %s", fe)
+    except Exception as e:
+        log_sync.error("Автоочистка отравленных Vision-данных: сбой: %s", e)
+
+
+def _push_db_to_server(self, local_db, server_db):
+    """Надёжная выгрузка БД на сервер: консистентный снапшот graph_rag.db через
+    sqlite3.backup() (без WAL-сайдкаров), копирование во временную папку и атомарная
+    замена двумя переименованиями. При любом сбое сервер остаётся со СТАРОЙ базой."""
+    import shutil, glob
+
+    # 0) Чистим осиротевшие временные папки: свои — всегда, чужие — старше 1 часа
+    now = time.time()
+    for p in glob.glob(server_db + ".tmp_*") + glob.glob(server_db + ".old_*"):
+        try:
+            if p.endswith(f"_{os.getpid()}") or now - os.path.getmtime(p) > 3600:
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+
+    # 1) Дренаж идущего раунда паука: _db_syncing уже стоит, но раунд, начатый раньше,
+    # может ещё писать. Дефолтный LLM-таймаут openai = 600 с сохранён (медленные модели),
+    # поэтому ждём до 660 с: потолок одного запроса 600 с + секунды записи; воркеры
+    # раунда параллельны. В норме раунд завершается за секунды — дренаж мгновенный,
+    # ожидание проявляется только при реально висящем LLM-вызове и логируется.
+    t0 = time.time()
+    if getattr(self, "_graph_round_active", False):
+        log_sync.info("Выгрузка БД: ждём завершения раунда паука (до 660 с)...")
+    while getattr(self, "_graph_round_active", False) and time.time() - t0 < 660:
+        time.sleep(1)
+    if getattr(self, "_graph_round_active", False):
+        log_sync.warning("Выгрузка БД: раунд паука не завершился за 660 с — копируем без дренажа "
+                         "(graph_rag.db защищён снапшотом; сайдкары исключены из копии)")
+
+    # 2) Консистентный снапшот graph_rag.db на локальный SSD (не в local_db, не на Z:).
+    # backup даёт логическую копию со всем закоммиченным WAL, без -wal/-shm файлов.
+    snapshot_path = os.path.join(get_local_path(), "graph_rag.snapshot.tmp")
+    graph_db_local = os.path.join(local_db, "graph_rag.db")
+    have_snapshot = False
+    if os.path.exists(graph_db_local):
+        # v1.1: осиротевший снапшот от краша предыдущей выгрузки — убираем ДО ретраев,
+        # иначе backup пишет в битый/непустой destination
+        try:
+            if os.path.exists(snapshot_path):
+                os.remove(snapshot_path)
+        except Exception:
+            pass
+        for attempt in range(3):
+            src_conn = dst_conn = None
+            try:
+                src_conn = sqlite3.connect(graph_db_local, timeout=30)
+                dst_conn = sqlite3.connect(snapshot_path)
+                with dst_conn:
+                    src_conn.backup(dst_conn)  # при живом писателе шаг перезапускается — ретраим
+                have_snapshot = True
+                break
+            except Exception as bk_err:
+                log_sync.warning("Снапшот graph_rag.db: попытка %d не удалась (%s): %s",
+                                 attempt + 1, _classify_net_error(bk_err), bk_err)
+            finally:
+                for c in (src_conn, dst_conn):
+                    try:
+                        if c is not None:
+                            c.close()
+                    except Exception:
+                        pass
+                if not have_snapshot:
+                    try:
+                        if os.path.exists(snapshot_path):
+                            os.remove(snapshot_path)
+                    except Exception:
+                        pass
+        if not have_snapshot:
+            raise RuntimeError("Не удалось получить снапшот graph_rag.db за 3 попытки")
+
+    # 3) Копия во временную папку рядом с серверной (тот же том — rename работает).
+    # graph_rag.db* не берём из живой папки — положим снапшот сами.
+    tmp_db = f"{server_db}.tmp_{os.getpid()}"
+    old_db = f"{server_db}.old_{os.getpid()}"
+    shutil.rmtree(tmp_db, ignore_errors=True)
+    shutil.rmtree(old_db, ignore_errors=True)
+    try:
+        shutil.copytree(local_db, tmp_db,
+                        ignore=shutil.ignore_patterns("graph_rag.db", "graph_rag.db-wal", "graph_rag.db-shm"))
+    except shutil.Error as copy_err:
+        # Исчезновение -wal/-shm НЕ фатально: сайдкары удаляются только после чекпоинта,
+        # т.е. их содержимое уже слито в основной файл. Любая другая потеря — фатальна.
+        fatal = [e for e in copy_err.args[0] if not str(e[0]).endswith(("-wal", "-shm"))]
+        if fatal:
+            shutil.rmtree(tmp_db, ignore_errors=True)
+            raise
+        log_sync.warning("Выгрузка БД: WAL-сайдкары исчезли при копировании (%d шт.) — скопировано без них",
+                         len(copy_err.args[0]))
+    if have_snapshot:
+        shutil.copy2(snapshot_path, os.path.join(tmp_db, "graph_rag.db"))
+        os.remove(snapshot_path)
+
+    # 4) Атомарная замена: live -> .old, tmp -> live; при сбое откат .old на место.
+    try:
+        if os.path.exists(server_db):
+            os.rename(server_db, old_db)
+        try:
+            os.rename(tmp_db, server_db)
+        except Exception:
+            if os.path.exists(old_db) and not os.path.exists(server_db):
+                try:
+                    os.rename(old_db, server_db)  # откат: сервер остаётся со старой базой
+                except Exception:
+                    log_sync.error("Откат выгрузки не удался — прежняя база лежит в %s", old_db)
+            raise
+    except Exception:
+        shutil.rmtree(tmp_db, ignore_errors=True)
+        raise
+    shutil.rmtree(old_db, ignore_errors=True)
+
+
 def sync_vector_db(self=None):
     try:
         # --- ПРЕДОХРАНИТЕЛЬ: Проверяем наличие реального ключа ---
@@ -2040,6 +3333,13 @@ def sync_vector_db(self=None):
         # ЭШЕЛОН ЗАЩИТЫ БАЗЫ: Гости только подключаются к БД, но не сканируют папки!
         if self is not None and getattr(self, "current_role", "guest") != "admin":
             return collection, collection.count()
+
+        # Автоочистка данных, отравленных текстом ошибки Vision API (до синка XWiki:
+        # пострадавшие страницы выйдут из states и будут перекачаны в этом же синке)
+        _cleanup_poisoned_vision_cache(collection)
+
+        # Новый цикл синхронизации: цепь сбоев Vision начинает с чистого состояния
+        _vision_circuit_reset()
         
         # Флаг защиты от гонки с графовым пауком (только админ-путь синхронизации)
         if self is not None:
@@ -2074,6 +3374,7 @@ def sync_vector_db(self=None):
         new_file_states = {}
         files_to_reindex = []
         untranscribed_audio = [] # Список для оповещений
+        failed_paths = [] # Файлы, пропущенные с ошибкой: не фиксируем в состояниях (ретрай на следующем синке)
 
         for file_path in found_files:
             filename = os.path.basename(file_path)
@@ -2136,6 +3437,7 @@ def sync_vector_db(self=None):
                 # Логируем ошибку, чтобы она не была тихой
                 if isinstance(text, str) and text.startswith("Ошибка"):
                     log_sync.warning("Индексатор: пропущен файл %s. Причина: %s", filename, text)
+                    failed_paths.append(file_path)
                     continue
 
                 display_source = filename
@@ -2185,26 +3487,31 @@ def sync_vector_db(self=None):
             msg = f"\n[Система: ⚠️ В базе обнаружены нерасшифрованные аудиофайлы ({len(unique_audio)} шт.): {display_names}. Запустить транскрибацию?]\n\n"
             self.after(0, lambda m=msg: self.append_to_chat(m))
 
+        # Ретрай пропущенных: файл с ошибкой распознавания не «залипает» в состояниях
+        for p in failed_paths:
+            new_file_states.pop(p, None)
+
         save_file_states(new_file_states)
 
         if self is not None and getattr(self, "current_role", "guest") == "admin":
-            import shutil
             server_db = os.path.join(get_base_path(), "smk_vector_db")
             local_db = db_path
             self.after(0, lambda: self.file_progress_label.configure(text="Отправка базы на сервер..."))
             try:
                 chromadb.api.client.SharedSystemClient.clear_system_cache()
-                shutil.rmtree(server_db, ignore_errors=True)
-                shutil.copytree(local_db, server_db)
+                _push_db_to_server(self, local_db, server_db)
                 client = chromadb.PersistentClient(path=local_db)
                 collection = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
+                log_sync.info("Выгрузка БД на сервер: ок (graph_rag.db — снапшот backup, замена через .tmp/.old)")
             except Exception as e:
-                log_sync.error("Ошибка выгрузки БД на сервер: %s", e)
+                log_sync.error("Ошибка выгрузки БД на сервер (серверная база не тронута): %s", e)
 
         total_chunks = collection.count()
         log_sync.info("Синхронизация БД: финиш (чанков: %d, файлов переиндексировано: %d)", total_chunks, len(files_to_reindex))
         return collection, total_chunks
     finally:
+        # Цепь сбоев Vision не переживает синхронизацию
+        _vision_circuit_reset()
         if self is not None:
             self._db_syncing = False
             self.after(0, lambda: self.update_progress_ui(0, "Синхронизация завершена"))
@@ -2513,6 +3820,139 @@ def _rebuild_window_chunk_ids(center_chunk_id, window_size):
     fp, idx = m.group(1), int(m.group(2))
     size = max(2, int(window_size or 6))
     return fp, [f"{fp}_chunk_{k}" for k in range(idx, idx + size)]
+
+# Счётчик повторных сбросов файла на пере-извлечение (фикс цикла автолечения: 2 сброса подряд
+# по одному файлу — один раз все рёбра, второй раз только протухшие; 3-й раз файл не сбрасываем)
+_autorepair_lvl2_counts = {}
+
+def _graph_autorepair_stale_edges(conn, docs_coll, all_id_set, window_size, max_files):
+    """Автолечение протухших якорей рёбер. Вызывается ТОЛЬКО из главного потока раунда
+    паука (сериализованный писатель); до сюда цикл не доходит при _db_syncing.
+    Уровень 1 (0 токенов LLM): рёбра с невалидными ссылками пере-якориваются матчером
+    _match_triplet_to_chunk по ТЕКУЩИМ чанкам файла — обновляются ОБА поля (source_chunk
+    и chunk_id: chunk_id — центр окна метода Б, протухший центр вернёт warning при
+    сбое якоря). Уровень 2: файл, где матч не сошёлся (текст реально менялся) — целиком
+    DELETE рёбер + сброс processed_chunks, паук пере-извлечёт штатным FIFO/poison-guard.
+    Возвращает (обновлено рёбер, файлов уровня 2, чанков в очередь). Не бросает исключений."""
+    updated_edges = lvl2_files = requeued_chunks = 0
+    try:
+        rows = conn.execute(
+            "SELECT id, source, relation, target, chunk_id, source_chunk FROM relations").fetchall()
+        if len(rows) > 100000:
+            log_graph.warning("Автолечение: relations слишком велика (%d строк) — проход пропущен", len(rows))
+            return 0, 0, 0
+        rows_by_fp, stale_by_fp = {}, {}
+        max_idx_cache = {}
+        def _file_chunks_info(fp):
+            # Один проход по all_id_set на файл: и макс. индекс, и отсортированный список
+            # чанков (используется и при детекте стейл-якорей, и при обработке файла)
+            if fp not in max_idx_cache:
+                prefix = fp + "_chunk_"
+                pairs = []
+                for i in all_id_set:
+                    if i.startswith(prefix):
+                        try:
+                            pairs.append((int(i.rsplit("_chunk_", 1)[1]), i))
+                        except ValueError:
+                            continue
+                pairs.sort()
+                max_i = pairs[-1][0] if pairs else -1
+                max_idx_cache[fp] = (max_i, [p[1] for p in pairs])
+            return max_idx_cache[fp]
+        for (rid, s, _rel, t, cid, sc) in rows:
+            fp, win_ids = _rebuild_window_chunk_ids(cid, window_size)
+            if fp is None:
+                continue  # GraphML (chunk_id = имя схемы): не лечится, пропускаем
+            rows_by_fp.setdefault(fp, []).append((rid, s, t))
+            # семантика = warning в _ground_graph_rows: невалидный source_chunk ЛИБО
+            # (при NULL) отсутствующие id окна, восстановленного из chunk_id.
+            # Фикс цикла: при NULL считаем протухом только id В ПРЕДЕЛАХ файла
+            # (индекс <= макс. существующего); фантомный хвост окна за концом файла
+            # (len(win)=6, файл короче) существовать и не должен — это НЕ протухание,
+            # иначе последние окна вечно ложатся в принудительный сброс каждого прохода.
+            if sc is not None and sc not in all_id_set:
+                stale_by_fp.setdefault(fp, []).append((rid, s, t))
+            elif not sc:
+                max_i, _ids = _file_chunks_info(fp)
+                for wi in win_ids:
+                    try:
+                        widx = int(wi.rsplit("_chunk_", 1)[1])
+                    except ValueError:
+                        continue
+                    if widx <= max_i and wi not in all_id_set:
+                        stale_by_fp.setdefault(fp, []).append((rid, s, t))
+                        break
+        # v1.1: сканируем ВСЮ таблицу до конца — строки одного файла рассеяны по таблице,
+        # ранний break оставлял бы неполные rows_by_fp/stale_by_fp даже для обрабатываемых
+        # файлов (Level 2 не удалял бы все рёбра). Лимит max_files применяется на фазе
+        # ОБРАБОТКИ: dict хранит порядок вставки — детерминированный выбор первых N файлов.
+        if not stale_by_fp:
+            log_graph.debug("Автолечение рёбер: протухших якорей не найдено")
+            return 0, 0, 0
+        for fp, file_rows in list(stale_by_fp.items())[:max_files]:
+            try:
+                cur_ids = _file_chunks_info(fp)[1]
+                if not cur_ids:
+                    # файла больше нет в индексе — только чистим его рёбра
+                    conn.executemany("DELETE FROM relations WHERE id = ?",
+                                     [(r[0],) for r in rows_by_fp.get(fp, [])])
+                    lvl2_files += 1
+                    log_graph.warning("Автолечение: файл %s исчез из индекса — удалено рёбер: %d",
+                                      os.path.basename(fp), len(rows_by_fp.get(fp, [])))
+                    continue
+                recs = docs_coll.get(ids=cur_ids, include=["documents"])
+                chunk_texts = [(i, d) for i, d in zip(recs.get("ids", []), recs.get("documents", [])) if d]
+                updates, miss = [], False
+                for (rid, s, t) in file_rows:
+                    mcid, lvl = _match_triplet_to_chunk([s, t], chunk_texts)  # БЕЗ LLM
+                    if lvl in ("both", "partial"):
+                        updates.append((mcid, mcid, rid))
+                    else:
+                        miss = True  # текст реально менялся — файл целиком на пере-извлечение
+                        break
+                if miss:
+                    resets = _autorepair_lvl2_counts.get(fp, 0)
+                    if resets >= 2:
+                        # Фикс цикла: файл уже дважды сбрасывался и извлечён заново, а якорь
+                        # всё равно не восстанавливается — сброс не помогает. Удаляем только
+                        # протухшие рёбра; валидные рёбра и очередь (processed_chunks) не трогаем,
+                        # иначе файл вечно крутится "пере-извлечение -> сброс -> пере-извлечение"
+                        conn.executemany("DELETE FROM relations WHERE id = ?",
+                                         [(r[0],) for r in file_rows])
+                        lvl2_files += 1
+                        log_graph.warning("Автолечение: файл %s — якорь не восстанавливается после "
+                                          "%d сбросов, повторный сброс заблокирован — удалены только "
+                                          "протухшие рёбра: %d",
+                                          os.path.basename(fp), resets, len(file_rows))
+                        continue
+                    _autorepair_lvl2_counts[fp] = resets + 1
+                    # весь файл: рёбра (в т.ч. случайно валидные) и сброс очереди
+                    conn.executemany("DELETE FROM relations WHERE id = ?",
+                                     [(r[0],) for r in rows_by_fp.get(fp, [])])
+                    conn.executemany("DELETE FROM processed_chunks WHERE chunk_id = ?", [(c,) for c in cur_ids])
+                    lvl2_files += 1
+                    requeued_chunks += len(cur_ids)
+                    log_graph.warning("Автолечение: файл %s — якорь не восстановлен, сброс на "
+                                      "пере-извлечение (рёбер удалено: %d, чанков в очередь: %d)",
+                                      os.path.basename(fp), len(rows_by_fp.get(fp, [])), len(cur_ids))
+                else:
+                    conn.executemany("UPDATE relations SET source_chunk = ?, chunk_id = ? WHERE id = ?", updates)
+                    updated_edges += len(updates)
+                    _autorepair_lvl2_counts.pop(fp, None)  # файл вылечен — счётчик сбросов обнуляем
+                    log_graph.info("Автолечение: файл %s — пере-якорено рёбер: %d",
+                                   os.path.basename(fp), len(updates))
+            except Exception as fe:
+                log_graph.error("Автолечение: сбой по файлу %s (%s): %s", fp, _classify_net_error(fe), fe)
+        conn.commit()
+        log_graph.info("Автолечение рёбер: финиш (уровень 1: рёбер %d; уровень 2: файлов %d, чанков в очередь %d)",
+                       updated_edges, lvl2_files, requeued_chunks)
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        log_graph.error("Автолечение рёбер: общая ошибка (%s): %s", _classify_net_error(e), e)
+    return updated_edges, lvl2_files, requeued_chunks
 
 def _ground_graph_rows(rows, client, norm_to_orig):
     """Точечный grounding: группировка рёбер по триплетам и файлам (ключ = file_path, НЕ отображаемое
@@ -3720,6 +5160,7 @@ DEFAULT_LOCAL_SETTINGS = {
     "use_main_model_for_audit": True,
     "api_temperature": 0.7,
     "api_reasoning": "Отключено",
+    "secretary_enabled": True,
     "rerank_enabled": False,
     "rerank_provider": "OpenRouter",
     "rerank_model": "cohere/rerank-4-fast",
@@ -3749,7 +5190,10 @@ DEFAULT_GLOBAL_SETTINGS = {
     "graph_rag_window": 6,
     "graph_rag_text_cap": 12000,
     "graph_rag_workers": 2,
-    "graph_rag_max_fails": 5
+    "graph_rag_max_fails": 5,
+    "graph_rag_autorepair_enabled": True,
+    "graph_rag_autorepair_every": 10,
+    "graph_rag_autorepair_max_files": 5
 }
 
 def load_local_settings():
@@ -3922,11 +5366,17 @@ class App(ctk.CTk):
         self.excel_iters_var = ctk.StringVar(value="10")
         self.api_temp_var = ctk.DoubleVar(value=self.current_settings.get("api_temperature", 0.7))
         self.api_reasoning_var = ctk.StringVar(value=self.current_settings.get("api_reasoning", "Отключено"))
+        self.secretary_enabled_var = ctk.BooleanVar(value=self.current_settings.get("secretary_enabled", True))
         self.save_path_event = threading.Event()
+        self.agent_max_steps_var = ctk.DoubleVar(value=self.current_settings.get("agent_max_steps", 25))
+        self.agent_stop_event = threading.Event()
+        self.agent_busy = False
         self._db_syncing = False  # Флаг защиты от гонки паук <-> sync_vector_db
+        self._graph_round_active = False  # Флаг активного раунда паука (дренаж при выгрузке БД)
         self.save_path_result = None
         self.save_path_queue = queue.Queue(maxsize=1)
         self.free_models_list = ["stepfun/step-3.5-flash:free", "google/gemini-2.0-flash-exp:free"]
+        self.model_reasoning_map = {}  # Карта reasoning-возможностей моделей (id -> {efforts, mandatory, default})
         self.top_models_list = []  # ТОП-10 популярных моделей (Data API rankings-daily)
         threading.Thread(target=self.fetch_free_models, daemon=True).start()
         threading.Thread(target=self.fetch_top_models, daemon=True).start()
@@ -4127,6 +5577,7 @@ class App(ctk.CTk):
 
         self.chat_history = []
         self.chat_attachments_dict = {}  # Формат: {"Имя_файла.pdf": "Текст..."}
+        self.chat_attachment_comments = {}  # D-2026-09-20-05: {"Имя.docx": "Отформатированный блок комментариев"}
         self.load_history()
         
         def init_db_thread():
@@ -4163,6 +5614,7 @@ class App(ctk.CTk):
         consecutive_fail_rounds = 0   # для экспоненциального бэкоффа (Task 5)
         fail_counts = {}              # center_id -> число подряд неудач (poison-guard)
         llm_unreachable = True        # True на старте → проверка связи в первом раунде; True после 403
+        round_counter = 0             # расписание автолечения якорей рёбер
         while True:
             conn = None
             try:
@@ -4215,7 +5667,15 @@ class App(ctk.CTk):
                 # spider использует query_embeddings=/upsert(embeddings=) — ef коллекции не вызывается,
                 # поэтому кэш безопасен; инвалидируется при синхронизации БД (см. выше).
                 if not getattr(self, "_graph_chroma_client", None):
-                    self._graph_chroma_client = chromadb.PersistentClient(path=get_db_path())
+                    # паук работает по локальной реплике: чужой пуш больше не заставляет
+                    # перетягивать всю базу (pull=False). Разовый безопасный pull (A5-паттерн)
+                    # только если локальной копии нет вовсе; при отставании — mtime-warning.
+                    local_vdb = os.path.join(get_local_path(), "local_vector_db")
+                    if not os.path.exists(os.path.join(local_vdb, "chroma.sqlite3")):
+                        _pull_db_from_server(os.path.join(get_base_path(), "smk_vector_db"), local_vdb)
+                    else:
+                        _warn_vector_db_lag()
+                    self._graph_chroma_client = chromadb.PersistentClient(path=get_db_path(pull=False))
                 ef = get_cloud_ef()
                 if not getattr(self, "_graph_docs_coll", None):
                     self._graph_docs_coll = self._graph_chroma_client.get_or_create_collection(name="smk_docs", embedding_function=ef)
@@ -4229,9 +5689,23 @@ class App(ctk.CTk):
                     self.after(0, lambda: self.graph_status_label.configure(text="🕸️ Граф: нет данных"))
                     time.sleep(delay); continue
                 conn = sqlite3.connect(get_graph_db_path(), timeout=30)
+                self._graph_round_active = True   # для дренажа при выгрузке БД на сервер
                 _ensure_embedding_cache_fresh(conn, ef_model)
                 processed = {r[0] for r in conn.execute("SELECT chunk_id FROM processed_chunks")}
                 all_id_set = set(all_ids)
+
+                # --- Автолечение протухших якорей рёбер: между раундами, в главном потоке
+                # раунда (сериализованный писатель), раз в N раундов. Уровень 2 сбрасывает
+                # processed_chunks — после лечения пере-считываем processed. ---
+                if round_counter % max(1, int(settings.get("graph_rag_autorepair_every", 10))) == 0 \
+                        and bool(settings.get("graph_rag_autorepair_enabled", True)):
+                    _upd, _lvl2, _rq = _graph_autorepair_stale_edges(
+                        conn, docs_coll, all_id_set, window_size,
+                        max(1, int(settings.get("graph_rag_autorepair_max_files", 5))))
+                    if _rq > 0:
+                        processed = {r[0] for r in conn.execute("SELECT chunk_id FROM processed_chunks")}
+                round_counter += 1
+
                 candidates = [cid for cid in all_ids if cid not in processed]
 
                 total = len(all_ids)
@@ -4445,12 +5919,21 @@ class App(ctk.CTk):
                 else:
                     sleep_time = delay  # успех — задержка в конце раунда
                 log_graph.info("Итог раунда: успехов=%d, неудач=%d, sleep=%d c", round_ok_count, round_fail_count, sleep_time)
+                # Соединение закрываем ДО паузы: при закрытии последнего соединения SQLite
+                # чекпоинтит и удаляет WAL-сайдкары — выгрузка БД не гоняется с -wal/-shm.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+                self._graph_round_active = False
                 time.sleep(sleep_time)
             except Exception:
                 log_graph.exception("Ошибка итерации паука")
                 try: time.sleep(5)
                 except Exception: pass
             finally:
+                self._graph_round_active = False
                 if conn is not None:
                     try: conn.close()
                     except Exception: pass
@@ -4473,9 +5956,28 @@ class App(ctk.CTk):
             models = data.get("data", []) if isinstance(data, dict) else []
 
             free_models = []
+            reasoning_map = {}
             for model in models:
                 if not isinstance(model, dict):
                     continue
+                # Карта reasoning собирается ДО фильтров бесплатных моделей: платные reasoning-модели
+                # (например z-ai/glm-5.3-flash) ниже отбрасываются continue и до них уже не дойти.
+                model_id = model.get("id")
+                reasoning = model.get("reasoning") or {}
+                if reasoning and model_id:
+                    entry = {
+                        "efforts": reasoning.get("supported_efforts"),      # None = принимает любые gateway-уровни
+                        "mandatory": bool(reasoning.get("mandatory", False)),
+                        "default": reasoning.get("default_effort")
+                    }
+                    reasoning_map[model_id] = entry
+                    # Версионированный канонический слаг (например z-ai/glm-5.3-flash-20260826):
+                    # именно его возвращают рейтинги ТОП-10 и выбирает пользователь — индексируем оба варианта.
+                    canonical_slug = str(model.get("canonical_slug") or "").strip()
+                    if canonical_slug and canonical_slug != model_id:
+                        reasoning_map[canonical_slug] = entry
+                    if model_id == "z-ai/glm-5.3-flash":
+                        log_core.debug("OpenRouter reasoning-объект для %s: %s", model_id, reasoning)
                 pricing = model.get("pricing", {}) or {}
                 if str(pricing.get("prompt", "")).strip() != "0" or str(pricing.get("completion", "")).strip() != "0":
                     continue
@@ -4485,7 +5987,6 @@ class App(ctk.CTk):
                 output_mods = [str(x).lower() for x in (arch.get("output_modalities") or [])]
                 if not (modality.endswith("->text") or "text" in output_mods):
                     continue
-                model_id = model.get("id")
                 if model_id:
                     free_models.append(model_id)
 
@@ -4494,6 +5995,11 @@ class App(ctk.CTk):
             self.free_models_list = sorted(set(free_models))
             _write_json_cache("free_models_cache.json",
                               {"fetched_at": datetime.now().isoformat(), "models": self.free_models_list})
+            # Модели без объекта reasoning в карту не попадают (не-reasoning модели и роутеры
+            # опускают это поле) — на этом держится гард «модель не reasoning» в agent_loop.
+            self.model_reasoning_map = reasoning_map
+            _write_json_cache("reasoning_map_cache.json",
+                              {"fetched_at": datetime.now().isoformat(), "map": reasoning_map})
             log_core.info("Бесплатные модели: загружено %d позиций", len(self.free_models_list))
         except Exception as e:
             log_core.warning("Загрузка бесплатных моделей не удалась (%s): %s — использую кэш/дефолт",
@@ -4504,6 +6010,26 @@ class App(ctk.CTk):
                 self.free_models_list = sorted(set(models))
                 log_core.info("Бесплатные модели: взяты из кэша (%d позиций, от %s)",
                               len(self.free_models_list), cached.get("fetched_at", "?"))
+            # При сбое сети reasoning-карта тоже берётся из кэша; если кэша нет — карта пустая
+            # (гард в agent_loop отключён, effort отправляется как есть)
+            cached_reasoning = _read_json_cache("reasoning_map_cache.json")
+            rmap = cached_reasoning.get("map") if isinstance(cached_reasoning, dict) else None
+            if isinstance(rmap, dict) and rmap:
+                self.model_reasoning_map = rmap
+
+    def get_model_reasoning_info(self, model_id):
+        """Reasoning-информация модели из карты каталога (точный ID или canonical_slug).
+        Fallback для старого кэша/ручного ввода: у версионированных слагов (…-YYYYMMDD),
+        которых нет в карте, пробуем базовый ID без суффикса даты."""
+        if not model_id:
+            return None
+        info = self.model_reasoning_map.get(model_id)
+        if info is not None:
+            return info
+        base_id = re.sub(r"-\d{8}$", "", model_id)
+        if base_id != model_id:
+            return self.model_reasoning_map.get(base_id)
+        return None
 
     def fetch_top_models(self):
         """ТОП-10 популярных моделей за сутки (OpenRouter Data API: /api/v1/datasets/rankings-daily).
@@ -4923,7 +6449,9 @@ class App(ctk.CTk):
             return {
                 "max_cells": 1000,
                 "temperature": 0.1,
-                "reasoning_effort": "medium",
+                # У гостя hardcoded-усилие убрано: бесплатные модели в основном не-reasoning,
+                # а через глобальную api_reasoning («Отключено» по умолчанию) ничего не отправляется
+                "reasoning_effort": "Отключено",
                 "max_iters": 10
             }
         try:
@@ -5442,12 +6970,12 @@ class App(ctk.CTk):
         
         if role == "admin":
             filetypes = [
-                ("Все поддерживаемые форматы", "*.txt *.md *.docx *.doc *.rtf *.pdf *.xlsx *.csv *.jpg *.jpeg *.png *.bmp *.graphml *.html *.mp3 *.wav *.m4a *.ogg *.flac"),
+                ("Все поддерживаемые форматы", "*.txt *.md *.docx *.doc *.rtf *.pdf *.xlsx *.xls *.csv *.jpg *.jpeg *.png *.bmp *.graphml *.html *.mp3 *.wav *.m4a *.ogg *.flac"),
                 ("Все файлы", "*.*")
             ]
         else:
             filetypes = [
-                ("Документы, таблицы и схемы", "*.txt *.md *.docx *.doc *.rtf *.pdf *.xlsx *.csv *.graphml *.html")
+                ("Документы, таблицы и схемы", "*.txt *.md *.docx *.doc *.rtf *.pdf *.xlsx *.xls *.csv *.graphml *.html")
             ]
 
         file_paths = filedialog.askopenfilenames(title="Прикрепить файлы", filetypes=filetypes)
@@ -5467,7 +6995,12 @@ class App(ctk.CTk):
             import win32com.client
             
             pythoncom.CoInitialize() # Инициализация COM-потока
-            
+
+            def _warn_attach_skip(message):
+                # Никаких тихих падений: сбой парсинга вложения виден и в консоли, и в GUI-логе чата
+                print(f"⚠️ [Вложения] {message}")
+                self.after(0, lambda m=message: self.append_to_chat(f"\n[⚠️ Система: {m}]\n", "system"))
+
             try:
                 # 2. ОПРЕДЕЛЕНИЕ ПУТЕЙ ОДИН РАЗ НА ВЕСЬ ПОТОК (Server & Exe Safe)
                 if getattr(sys, 'frozen', False):
@@ -5477,12 +7010,17 @@ class App(ctk.CTk):
                 
                 cache_dir = os.path.join(base_dir, ".cache")
                 os.makedirs(cache_dir, exist_ok=True)
-                
+
+                # Действие пользователя: не наследуем цепь сбоев Vision от параллельного синка
+                if any(os.path.splitext(fp)[1].lower() in ('.pdf', '.jpg', '.jpeg', '.png', '.bmp') for fp in file_paths):
+                    _vision_circuit_reset()
+
                 # 3. ГЛАВНЫЙ ЦИКЛ ОБРАБОТКИ
                 for file_path in file_paths:
                     try:
                         ext = os.path.splitext(file_path)[1].lower()
                         text_content = ""
+                        comments_count, comments_block = 0, None  # D-2026-09-20-05
                         
                         # --- СНИМОК ДО ПАРСИНГА И БАЗОВОЕ ИМЯ ---
                         cache_snapshot_before = set(os.listdir(cache_dir)) if os.path.exists(cache_dir) else set()
@@ -5502,13 +7040,26 @@ class App(ctk.CTk):
                             parsed_raw = read_docx_with_indices(file_path)
                             # Защита от Tuple
                             text_content = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
+                            comments_count, comments_block = _extract_docx_comments(
+                                file_path,
+                                paras=parsed_raw[1] if isinstance(parsed_raw, tuple) else None)
                             
                         elif ext in ['.xlsx', '.xls']:
+                            # .xls не читается openpyxl/pandas напрямую — конверсия в .xlsx через Excel COM
+                            working_path = file_path
+                            converted = None
+                            if ext == '.xls':
+                                converted = _get_or_convert_xls(file_path)
+                                if converted:
+                                    working_path = converted
+                                else:
+                                    _warn_attach_skip(f"Не удалось конвертировать {os.path.basename(file_path)} (.xls → .xlsx) — файл пропущен (проверьте, что он не защищён паролем)")
+                                    continue
                             try:
                                 import pandas as pd
                                 params = self.get_excel_params()
                                 threshold = params['max_cells']
-                                wb = openpyxl.load_workbook(file_path, read_only=True)
+                                wb = openpyxl.load_workbook(working_path, read_only=True)
                                 visible_sheets = []
                                 total_cells = 0
                                 for sheet_name in wb.sheetnames:
@@ -5524,42 +7075,60 @@ class App(ctk.CTk):
                                 if total_cells < threshold:
                                     csv_data = ""
                                     for sheet_name in visible_sheets:
-                                        df = pd.read_excel(file_path, sheet_name=sheet_name)
+                                        df = pd.read_excel(working_path, sheet_name=sheet_name)
                                         csv_data += f"\n--- Лист: {sheet_name} ---\n"
                                         csv_data += df.to_csv(index=False) + "\n"
                                     if len(csv_data) > 50000:
                                         csv_data = csv_data[:50000] + "\n... (данные обрезаны)"
                                     text_content = csv_data
                                 else:
-                                    summary = f"Путь к файлу: {file_path}\n\nСтруктура:\n"
+                                    summary = f"Путь к файлу: {working_path}\n\nСтруктура:\n"
                                     for sheet_name in visible_sheets:
-                                        df = pd.read_excel(file_path, sheet_name=sheet_name, nrows=5)
+                                        df = pd.read_excel(working_path, sheet_name=sheet_name, nrows=5)
                                         summary += f"\nЛист: {sheet_name}\n"
                                         summary += f"  Колонки: {', '.join(map(str, df.columns.tolist()))}\n"
-                                        full_df = pd.read_excel(file_path, sheet_name=sheet_name)
+                                        full_df = pd.read_excel(working_path, sheet_name=sheet_name)
                                         summary += f"  Количество строк: {len(full_df)}\n"
+                                    xls_note = (
+                                        f" (конвертирован из .xls — оригинал: {os.path.basename(file_path)})"
+                                        if converted else ""
+                                    )
                                     text_content = (
-                                        f"Пользователь прикрепил большой Excel файл по пути: {file_path}. "
+                                        f"Пользователь прикрепил большой Excel файл по пути: {working_path}{xls_note}. "
                                         f"Структура: {summary} "
                                         f"Используй инструмент execute_python_code для ответа на вопросы по этому файлу."
                                     )
                             except Exception as excel_err:
-                                text_content = extract_text_from_excel_for_rag(file_path)
+                                text_content = extract_text_from_excel_for_rag(working_path)
+                            if ext == '.xlsx' or converted:
+                                comments_count, comments_block = _extract_xlsx_comments(working_path)
                             
                         elif ext == '.pdf':
                             if role == "admin":
                                 # Продвинутый парсер PDF (с картинками и Vision OCR) для admin-роли
-                                text_content = extract_smart_vision_and_pdf(file_path)
+                                try:
+                                    text_content = extract_smart_vision_and_pdf(file_path)
+                                except VisionAPIError as ve:
+                                    # Транзитное сообщение в контекст LLM; в кэш не пишется
+                                    text_content = (f"Ошибка распознавания файла {os.path.basename(file_path)} ({ve.kind}). "
+                                                    "Сообщи пользователю, что файл временно не удалось распознать, и предложи повторить позже.")
                             else:
                                 text_content = extract_text_from_pdf(file_path)
                                 
                         elif role == "admin" and ext in ['.jpg', '.jpeg', '.png', '.bmp']:
                             # Vision API для изображений (через умный Vision-роутер)
-                            text_content = extract_smart_vision_and_pdf(file_path)
+                            try:
+                                text_content = extract_smart_vision_and_pdf(file_path)
+                            except VisionAPIError as ve:
+                                # Транзитное сообщение в контекст LLM; в кэш не пишется
+                                text_content = (f"Ошибка распознавания файла {os.path.basename(file_path)} ({ve.kind}). "
+                                                "Сообщи пользователю, что файл временно не удалось распознать, и предложи повторить позже.")
                             
                         elif ext in ['.doc', '.rtf']:
                             # Вложения используют безопасную локальную песочницу
-                            text_content = safe_read_old_word_file(file_path)
+                            legacy_text, comments_count, comments_block = safe_read_old_word_file(
+                                file_path, return_comments=True)
+                            text_content = legacy_text
                                 
                         elif role == "admin" and ext in ['.mp3', '.wav', '.m4a', '.ogg', '.flac']:
                             # ЛЕНИВАЯ ЗАГРУЗКА: Не парсим аудио сейчас. Просто сохраняем маркер с путем.
@@ -5588,25 +7157,44 @@ class App(ctk.CTk):
 
                         # 4. ФИНАЛЬНАЯ ВАЛИДАЦИЯ И СОХРАНЕНИЕ
                         if not text_content or not isinstance(text_content, str) or not text_content.strip():
+                            _warn_attach_skip(f"Не удалось извлечь текст из {os.path.basename(file_path)} — вложение пропущено (возможно, текст в надписях/картинках или файл повреждён)")
                             continue
                             
                         # Защита от попадания текста ошибки в контекст нейросети
                         if text_content.startswith("Ошибка"):
-                            print(f"⚠️ [Вложения] Пропущен файл {os.path.basename(file_path)}. Причина: {text_content}")
+                            _warn_attach_skip(f"Пропущен файл {os.path.basename(file_path)}. Причина: {text_content}")
                             continue
 
-                        base_name = os.path.basename(file_path)
+                        # D-2026-09-18-04: ключ вложения — в канонической NFC-форме
+                        base_name = _norm_filename(os.path.basename(file_path))
                         name, e = os.path.splitext(base_name)
                         final_name = base_name
                         counter = 1
                         while final_name in getattr(self, "chat_attachments_dict", {}):
                             final_name = f"{name} ({counter}){e}"
                             counter += 1
-                        
+
+                        # D-2026-09-20-05: при наличии комментариев — маркер в текст вложения
+                        # и полный блок в параллельный словарь (чипы и системный промпт не замусориваются)
+                        if comments_count > 0 and comments_block:
+                            text_content += (
+                                f"\n\n[СИСТЕМНАЯ МЕТКА: В файле '{final_name}' найдено {comments_count} комментариев. "
+                                f"Не читай их самовольно: спроси у пользователя разрешение и только после явного согласия "
+                                f"вызови инструмент read_file_comments с именем '{final_name}'.]"
+                            )
+
                         self.chat_attachments_dict[final_name] = text_content
+                        if comments_count > 0 and comments_block:
+                            comments_map = getattr(self, "chat_attachment_comments", None)
+                            if comments_map is None:
+                                comments_map = self.chat_attachment_comments = {}
+                            comments_map[final_name] = comments_block
+                            self.after(0, lambda c=comments_count, n=final_name: self.append_to_chat(
+                                f"\n[ℹ️ Система: В '{n}' найдено {c} комментариев. Спросите меня или Агента, чтобы прочитать их.]\n",
+                                "system"))
                         
                     except Exception as e:
-                        print(f"Ошибка чтения {file_path}: {e}")
+                        _warn_attach_skip(f"Ошибка чтения {os.path.basename(file_path)}: {e}")
             finally:
                 pythoncom.CoUninitialize() # Очистка COM-потока
                 self.after(0, self.refresh_attached_files_ui) # Обновление интерфейса
@@ -5639,6 +7227,8 @@ class App(ctk.CTk):
         """Удаляет файл из вложений чата."""
         if filename in getattr(self, "chat_attachments_dict", {}):
             del self.chat_attachments_dict[filename]
+            # D-2026-09-20-05: блок комментариев удаляется вместе с вложением
+            getattr(self, "chat_attachment_comments", {}).pop(filename, None)
             self.refresh_attached_files_ui()
             self.save_current_session()
 
@@ -5822,10 +7412,13 @@ class App(ctk.CTk):
                     webbrowser.open(filename)
                     break
                 if filename:
-                    # Используем наш новый универсальный локатор!
+                    # Используем наш новый универсальный локатор (с нечётким фолбэком, D-2026-09-20-02)
                     target_file = find_target_file(filename)
+                    if not target_file:
+                        target_file = find_target_file(filename, allow_fuzzy=True)
                     
                     if target_file and os.path.exists(target_file):
+                        resolved_name = _strip_attach_hash_prefix(os.path.basename(target_file))
                         if self.current_role == "guest":
                             base_name = os.path.basename(target_file)
                             safe_filename = f"СМК_Чтение_{base_name}"
@@ -5834,10 +7427,14 @@ class App(ctk.CTk):
                             self.append_to_chat(f"\n[Система: Guest-режим. Открываем безопасную копию: '{safe_path}']\n")
                             os.startfile(os.path.abspath(safe_path))
                         else:
-                            self.append_to_chat(f"\n[Система: Admin-режим. Открываем оригинал файла '{filename}']\n")
+                            self.append_to_chat(f"\n[Система: Admin-режим. Открываем оригинал файла '{resolved_name}']\n")
                             os.startfile(os.path.abspath(target_file))
                     else:
-                        self.append_to_chat(f"\n[Система: Файл '{filename}' не найден в разрешенных директориях]\n")
+                        suggestions = _suggest_similar_files(filename)
+                        err = f"[Система: Файл '{filename}' не найден в разрешенных директориях]\n"
+                        if suggestions:
+                            err = f"[Система: Файл '{filename}' не найден в разрешенных директориях. Ближайшие совпадения: {'; '.join(suggestions)}]\n"
+                        self.append_to_chat(err)
                 break
             elif tag.startswith("weblink_"):
                 url = self.link_map.get(tag)
@@ -5913,7 +7510,8 @@ class App(ctk.CTk):
                 "chat_history": self.chat_history,
                 "display_text": display_text,
                 "message_counter": self.message_counter,
-                "chat_attachments_dict": getattr(self, "chat_attachments_dict", {})
+                "chat_attachments_dict": getattr(self, "chat_attachments_dict", {}),
+                "chat_attachment_comments": getattr(self, "chat_attachment_comments", {})
             }
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -5932,7 +7530,16 @@ class App(ctk.CTk):
             self.message_counter = data.get("message_counter", 0)
             display_text = data.get("display_text", "")
 
-            self.chat_attachments_dict = data.get("chat_attachments_dict", {})
+            # D-2026-09-18-04: ключи в канонической NFC-форме (лечит старые сессии с NFD-именами)
+            restored_attachments = {}
+            for k, v in data.get("chat_attachments_dict", {}).items():
+                restored_attachments.setdefault(_norm_filename(k), v)
+            self.chat_attachments_dict = restored_attachments
+            # D-2026-09-20-05: блоки комментариев живут рядом с вложениями, ключи тоже NFC
+            restored_comments = {}
+            for k, v in data.get("chat_attachment_comments", {}).items():
+                restored_comments.setdefault(_norm_filename(k), v)
+            self.chat_attachment_comments = restored_comments
             self.after(0, self.refresh_attached_files_ui)
 
             self.chat_textbox.configure(state="normal")
@@ -6084,6 +7691,14 @@ class App(ctk.CTk):
             if getattr(self, "current_role", "guest") != "admin":
                 return
 
+            # Выключатель секретаря: снятый чекбокс полностью отключает фоновую работу
+            if not self.current_settings.get("secretary_enabled", True):
+                return
+            model = (self.global_settings.get("secretary_model") or "").strip()
+            if not model:
+                log_llm.warning("Фоновый секретарь: модель не задана — пропуск (укажите модель или снимите чекбокс)")
+                return
+
             # Формируем контекст из последних сообщений
             context = "\n".join([f"{m.get('role', 'unknown')}: {m.get('content', '')[:200]}" for m in recent_messages])
             
@@ -6095,7 +7710,7 @@ class App(ctk.CTk):
             
             t0 = time.time()
             response = get_llm_client().chat.completions.create(
-                model=self.global_settings.get("secretary_model", "stepfun/step-3.5-flash:free"),
+                model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Проанализируй этот диалог:\n{context}"}
@@ -6104,7 +7719,7 @@ class App(ctk.CTk):
             )
             usage = getattr(response, "usage", None)
             log_llm.info("Фоновый секретарь: model=%s, latency=%.2fs, status=ok, prompt_tokens=%s, completion_tokens=%s",
-                         self.global_settings.get("secretary_model", ""),
+                         model,
                          time.time() - t0,
                          getattr(usage, "prompt_tokens", None), getattr(usage, "completion_tokens", None))
 
@@ -6127,6 +7742,7 @@ class App(ctk.CTk):
         self.chat_textbox.configure(state="disabled")
         self.chat_history = []
         self.chat_attachments_dict = {}
+        self.chat_attachment_comments = {}  # D-2026-09-20-05
         self.after(0, self.refresh_attached_files_ui)
         self.message_counter = 0  # Сброс счетчика сообщений
         self.current_session_id = str(uuid.uuid4())
@@ -6474,67 +8090,92 @@ class App(ctk.CTk):
 
         # --- ВИДЖЕТЫ ГРАФОВ (GRAPHRAG) ---
         if is_admin and tab_graph is not None:
+            # Два столбца внутри вкладки: вкладка не помещалась на экран по высоте
+            col_left = ctk.CTkFrame(tab_graph, fg_color="transparent")
+            col_left.pack(side="left", fill="both", expand=True, padx=(5, 2))
+            col_right = ctk.CTkFrame(tab_graph, fg_color="transparent")
+            col_right.pack(side="right", fill="both", expand=True, padx=(2, 5))
             self.graph_rag_enabled_var = ctk.BooleanVar(value=self.global_settings.get("graph_rag_enabled", False))
-            ctk.CTkSwitch(tab_graph, text="Включить Graph RAG (фоновый Паук)", variable=self.graph_rag_enabled_var, font=ctk.CTkFont(weight="bold")).pack(pady=(10, 15))
+            ctk.CTkSwitch(col_left, text="Включить Graph RAG (фоновый Паук)", variable=self.graph_rag_enabled_var, font=ctk.CTkFont(weight="bold")).pack(pady=(10, 15))
 
-            ctk.CTkLabel(tab_graph, text="Модель извлечения сущностей (бесплатная):").pack(pady=(10, 0))
+            ctk.CTkLabel(col_left, text="Модель извлечения сущностей (бесплатная):").pack(pady=(10, 0))
             self.graph_rag_model_var = ctk.StringVar(value=self.global_settings.get("graph_rag_model", "deepseek/deepseek-v4-flash-0731"))
             # Ссылка на self — для фонового обновления списка бесплатных моделей без переоткрытия окна
-            self.graph_rag_model_combo = ctk.CTkComboBox(tab_graph, variable=self.graph_rag_model_var, values=self.free_models_list, width=300)
+            self.graph_rag_model_combo = ctk.CTkComboBox(col_left, variable=self.graph_rag_model_var, values=self.free_models_list, width=300)
             self.graph_rag_model_combo.pack(pady=5)
 
-            ctk.CTkLabel(tab_graph, text="Задержка Паука (сек между итерациями):", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 0))
+            ctk.CTkLabel(col_left, text="Задержка Паука (сек между итерациями):", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 0))
             self.graph_rag_delay_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_delay", 60)))
-            graph_delay_slider = ctk.CTkSlider(tab_graph, from_=2, to=300, number_of_steps=298, variable=self.graph_rag_delay_var, width=300)
+            graph_delay_slider = ctk.CTkSlider(col_left, from_=2, to=300, number_of_steps=298, variable=self.graph_rag_delay_var, width=300)
             graph_delay_slider.pack(pady=(5, 0))
-            graph_delay_label = ctk.CTkLabel(tab_graph, text=f"{int(self.graph_rag_delay_var.get())} сек")
+            graph_delay_label = ctk.CTkLabel(col_left, text=f"{int(self.graph_rag_delay_var.get())} сек")
             graph_delay_label.pack(pady=(0, 5))
             graph_delay_slider.configure(command=lambda v: graph_delay_label.configure(text=f"{int(v)} сек"))
 
             # Окно чанков за раунд (центр + следующие N-1 того же файла)
-            ctk.CTkLabel(tab_graph, text="Окно чанков за раунд (2-12):").pack(pady=(10, 0))
+            ctk.CTkLabel(col_left, text="Окно чанков за раунд (2-12):").pack(pady=(10, 0))
             self.graph_rag_window_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_window", 6)))
-            graph_window_slider = ctk.CTkSlider(tab_graph, from_=2, to=12, number_of_steps=10, variable=self.graph_rag_window_var, width=300)
+            graph_window_slider = ctk.CTkSlider(col_left, from_=2, to=12, number_of_steps=10, variable=self.graph_rag_window_var, width=300)
             graph_window_slider.pack(pady=(5, 0))
-            graph_window_label = ctk.CTkLabel(tab_graph, text=f"{int(self.graph_rag_window_var.get())} чанков")
+            graph_window_label = ctk.CTkLabel(col_left, text=f"{int(self.graph_rag_window_var.get())} чанков")
             graph_window_label.pack(pady=(0, 5))
             graph_window_slider.configure(command=lambda v: graph_window_label.configure(text=f"{int(v)} чанков"))
 
             # Лимит выходных токенов (страховка от зацикливания reasoning-моделей; не оптимизатор токенов)
-            ctk.CTkLabel(tab_graph, text="Лимит выходных токенов (страховка от зацикливания):").pack(pady=(10, 0))
+            ctk.CTkLabel(col_left, text="Лимит выходных токенов (страховка от зацикливания):").pack(pady=(10, 0))
             self.graph_rag_max_tokens_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_max_tokens", 16000)))
-            graph_tokens_slider = ctk.CTkSlider(tab_graph, from_=1000, to=32000, number_of_steps=310, variable=self.graph_rag_max_tokens_var, width=300)
+            graph_tokens_slider = ctk.CTkSlider(col_left, from_=1000, to=32000, number_of_steps=310, variable=self.graph_rag_max_tokens_var, width=300)
             graph_tokens_slider.pack(pady=(5, 0))
-            graph_tokens_label = ctk.CTkLabel(tab_graph, text=f"{int(self.graph_rag_max_tokens_var.get())} токенов")
+            graph_tokens_label = ctk.CTkLabel(col_left, text=f"{int(self.graph_rag_max_tokens_var.get())} токенов")
             graph_tokens_label.pack(pady=(0, 5))
             graph_tokens_slider.configure(command=lambda v: graph_tokens_label.configure(text=f"{int(v)} токенов"))
 
             # Cap текста в окне (символов)
-            ctk.CTkLabel(tab_graph, text="Cap текста в окне (2000-30000 симв.):").pack(pady=(10, 0))
+            ctk.CTkLabel(col_left, text="Cap текста в окне (2000-30000 симв.):").pack(pady=(10, 0))
             self.graph_rag_text_cap_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_text_cap", 12000)))
-            graph_cap_slider = ctk.CTkSlider(tab_graph, from_=2000, to=30000, number_of_steps=280, variable=self.graph_rag_text_cap_var, width=300)
+            graph_cap_slider = ctk.CTkSlider(col_left, from_=2000, to=30000, number_of_steps=280, variable=self.graph_rag_text_cap_var, width=300)
             graph_cap_slider.pack(pady=(5, 0))
-            graph_cap_label = ctk.CTkLabel(tab_graph, text=f"{int(self.graph_rag_text_cap_var.get())} симв.")
+            graph_cap_label = ctk.CTkLabel(col_left, text=f"{int(self.graph_rag_text_cap_var.get())} симв.")
             graph_cap_label.pack(pady=(0, 5))
             graph_cap_slider.configure(command=lambda v: graph_cap_label.configure(text=f"{int(v)} симв."))
 
             # Потоки LLM-извлечения (1-3)
-            ctk.CTkLabel(tab_graph, text="Потоки LLM-извлечения (1-3):").pack(pady=(10, 0))
+            ctk.CTkLabel(col_left, text="Потоки LLM-извлечения (1-3):").pack(pady=(10, 0))
             self.graph_rag_workers_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_workers", 2)))
-            graph_workers_slider = ctk.CTkSlider(tab_graph, from_=1, to=3, number_of_steps=2, variable=self.graph_rag_workers_var, width=300)
+            graph_workers_slider = ctk.CTkSlider(col_left, from_=1, to=3, number_of_steps=2, variable=self.graph_rag_workers_var, width=300)
             graph_workers_slider.pack(pady=(5, 0))
-            graph_workers_label = ctk.CTkLabel(tab_graph, text=f"{int(self.graph_rag_workers_var.get())} поток")
+            graph_workers_label = ctk.CTkLabel(col_left, text=f"{int(self.graph_rag_workers_var.get())} поток")
             graph_workers_label.pack(pady=(0, 5))
             graph_workers_slider.configure(command=lambda v: graph_workers_label.configure(text=f"{int(v)} поток"))
 
             # Max неудач подряд по чанку (poison-guard)
-            ctk.CTkLabel(tab_graph, text="Max неудач подряд по чанку (1-20):").pack(pady=(10, 0))
+            ctk.CTkLabel(col_left, text="Max неудач подряд по чанку (1-20):").pack(pady=(10, 0))
             self.graph_rag_max_fails_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_max_fails", 5)))
-            graph_fails_slider = ctk.CTkSlider(tab_graph, from_=1, to=20, number_of_steps=19, variable=self.graph_rag_max_fails_var, width=300)
+            graph_fails_slider = ctk.CTkSlider(col_left, from_=1, to=20, number_of_steps=19, variable=self.graph_rag_max_fails_var, width=300)
             graph_fails_slider.pack(pady=(5, 0))
-            graph_fails_label = ctk.CTkLabel(tab_graph, text=f"{int(self.graph_rag_max_fails_var.get())} неудач")
+            graph_fails_label = ctk.CTkLabel(col_left, text=f"{int(self.graph_rag_max_fails_var.get())} неудач")
             graph_fails_label.pack(pady=(0, 5))
             graph_fails_slider.configure(command=lambda v: graph_fails_label.configure(text=f"{int(v)} неудач"))
+
+            # Автолечение протухших якорей рёбер (фоновое, между раундами Паука; 0 токенов на уровне 1)
+            self.graph_rag_autorepair_enabled_var = ctk.BooleanVar(value=self.global_settings.get("graph_rag_autorepair_enabled", True))
+            ctk.CTkSwitch(col_right, text="Автолечение якорей рёбер графа", variable=self.graph_rag_autorepair_enabled_var).pack(pady=(10, 5))
+
+            ctk.CTkLabel(col_right, text="Автолечение: раз в N раундов (1-50):").pack(pady=(10, 0))
+            self.graph_rag_autorepair_every_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_autorepair_every", 10)))
+            graph_repair_every_slider = ctk.CTkSlider(col_right, from_=1, to=50, number_of_steps=49, variable=self.graph_rag_autorepair_every_var, width=300)
+            graph_repair_every_slider.pack(pady=(5, 0))
+            graph_repair_every_label = ctk.CTkLabel(col_right, text=f"каждые {int(self.graph_rag_autorepair_every_var.get())} раундов")
+            graph_repair_every_label.pack(pady=(0, 5))
+            graph_repair_every_slider.configure(command=lambda v: graph_repair_every_label.configure(text=f"каждые {int(v)} раундов"))
+
+            ctk.CTkLabel(col_right, text="Автолечение: макс. файлов за проход (1-20):").pack(pady=(10, 0))
+            self.graph_rag_autorepair_max_files_var = ctk.DoubleVar(value=float(self.global_settings.get("graph_rag_autorepair_max_files", 5)))
+            graph_repair_files_slider = ctk.CTkSlider(col_right, from_=1, to=20, number_of_steps=19, variable=self.graph_rag_autorepair_max_files_var, width=300)
+            graph_repair_files_slider.pack(pady=(5, 0))
+            graph_repair_files_label = ctk.CTkLabel(col_right, text=f"{int(self.graph_rag_autorepair_max_files_var.get())} файлов")
+            graph_repair_files_label.pack(pady=(0, 5))
+            graph_repair_files_slider.configure(command=lambda v: graph_repair_files_label.configure(text=f"{int(v)} файлов"))
 
         # --- ВКЛАДКА 1: МОДЕЛИ ---
         ctk.CTkLabel(tab_models, text="ID Модели (OpenRouter):").pack(pady=(10, 0))
@@ -6592,6 +8233,12 @@ class App(ctk.CTk):
                                 self.graph_rag_model_combo.configure(values=[gr_val] + self.free_models_list)
                     except Exception:
                         pass
+                # Синхронно обновляем комбобокс reasoning-уровней под выбранную модель
+                if getattr(self, "_update_reasoning_combo", None) is not None:
+                    try:
+                        self._update_reasoning_combo()
+                    except Exception:
+                        pass
             except Exception as e:
                 log_ui.warning("Обновление комбобоксов моделей: %s", e)
 
@@ -6619,8 +8266,41 @@ class App(ctk.CTk):
         api_temp_slider.configure(command=lambda v: api_temp_label.configure(text=f"{v:.1f}"))
 
         ctk.CTkLabel(tab_models, text="Степень размышления (Reasoning Effort):", font=ctk.CTkFont(weight="bold")).pack(pady=(5, 0))
-        api_reasoning_combo = ctk.CTkComboBox(tab_models, values=["Отключено", "low", "medium", "high"], width=200, variable=self.api_reasoning_var)
+        api_reasoning_combo = ctk.CTkComboBox(tab_models, values=["Отключено"], width=200, variable=self.api_reasoning_var)
         api_reasoning_combo.pack(pady=(5, 10))
+
+        _ALL_EFFORTS = ["Отключено", "low", "medium", "high", "max"]
+
+        def _update_reasoning_combo():
+            """Список уровней reasoning — по выбранной модели (карта из /api/v1/models).
+            Модель без объекта reasoning в карте (не-reasoning или неизвестный ID) — только «Отключено»."""
+            if not (settings_window.winfo_exists() and api_reasoning_combo.winfo_exists()):
+                return
+            selected_model = model_entry.get().strip()
+            info = self.get_model_reasoning_info(selected_model)
+            if info and info.get("efforts"):
+                new_values = ["Отключено"] + list(info["efforts"])
+            elif info is not None:  # в карте, но efforts is None — принимает любые gateway-уровни
+                new_values = list(_ALL_EFFORTS)
+            else:  # модели в карте нет (не-reasoning или ручной ввод неизвестного ID)
+                new_values = ["Отключено"]
+            api_reasoning_combo.configure(values=new_values)
+            current = self.api_reasoning_var.get()
+            if current not in new_values:
+                log_core.warning("Уровень reasoning '%s' недоступен для модели '%s' — сброс на «Отключено»",
+                                 current, selected_model)
+                self.api_reasoning_var.set("Отключено")
+
+        self._update_reasoning_combo = _update_reasoning_combo
+        model_entry.configure(command=lambda _choice: _update_reasoning_combo())
+        _update_reasoning_combo()
+
+        ctk.CTkLabel(tab_models, text="Макс. шагов цикла поиска/размышления (Excel — отдельный лимит):", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 0))
+        agent_steps_slider = ctk.CTkSlider(tab_models, from_=5, to=60, number_of_steps=55, variable=self.agent_max_steps_var, width=300)
+        agent_steps_slider.pack(pady=(5, 0))
+        agent_steps_label = ctk.CTkLabel(tab_models, text=f"{int(self.agent_max_steps_var.get())}")
+        agent_steps_label.pack(pady=(0, 5))
+        agent_steps_slider.configure(command=lambda v: agent_steps_label.configure(text=f"{int(float(v))}"))
 
         ctk.CTkLabel(tab_models, text="Модель для Vision (OCR сканов и схем):").pack(pady=(10, 0))
         vision_entry = ctk.CTkEntry(tab_models, width=450)
@@ -6633,6 +8313,15 @@ class App(ctk.CTk):
         secretary_entry.pack(pady=5)
         secretary_entry.insert(0, self.global_settings.get("secretary_model", "openai/gpt-4o-mini"))
         if not is_admin: secretary_entry.configure(state="disabled", text_color="gray")
+
+        secretary_checkbox = ctk.CTkCheckBox(
+            tab_models,
+            text="Фоновый Секретарь: запоминать новые факты СМК",
+            variable=self.secretary_enabled_var
+        )
+        secretary_checkbox.pack(pady=(0, 5))
+        if not is_admin:
+            secretary_checkbox.configure(state="disabled", text_color="gray")
 
         ctk.CTkLabel(tab_models, text="Модель Эмбеддингов (нужен перезапуск):").pack(pady=(10, 0))
         embed_entry = ctk.CTkEntry(tab_models, width=450)
@@ -6942,6 +8631,7 @@ class App(ctk.CTk):
 
             self.current_settings["api_temperature"] = float(self.api_temp_var.get())
             self.current_settings["api_reasoning"] = self.api_reasoning_var.get()
+            self.current_settings["agent_max_steps"] = int(self.agent_max_steps_var.get())
 
             if is_admin:
                 # Настройки Аудио и Прокси (СОХРАНЯЕТ ТОЛЬКО АДМИН)
@@ -7003,6 +8693,9 @@ class App(ctk.CTk):
                 self.global_settings["secretary_model"] = secretary_entry.get().strip()
                 self.global_settings["embedding_model"] = embed_entry.get().strip()
 
+                # Выключатель Фонового Секретаря
+                self.current_settings["secretary_enabled"] = bool(self.secretary_enabled_var.get())
+
                 # 2.0 Сохранение GraphRAG
                 if hasattr(self, "graph_rag_enabled_var"):
                     self.global_settings["graph_rag_enabled"] = bool(self.graph_rag_enabled_var.get())
@@ -7031,6 +8724,17 @@ class App(ctk.CTk):
                         self.global_settings["graph_rag_max_fails"] = int(self.graph_rag_max_fails_var.get())
                     except Exception:
                         self.global_settings["graph_rag_max_fails"] = 5
+                    # Автолечение якорей рёбер
+                    if hasattr(self, "graph_rag_autorepair_enabled_var"):
+                        self.global_settings["graph_rag_autorepair_enabled"] = bool(self.graph_rag_autorepair_enabled_var.get())
+                        try:
+                            self.global_settings["graph_rag_autorepair_every"] = max(1, int(self.graph_rag_autorepair_every_var.get()))
+                        except Exception:
+                            self.global_settings["graph_rag_autorepair_every"] = 10
+                        try:
+                            self.global_settings["graph_rag_autorepair_max_files"] = max(1, min(20, int(self.graph_rag_autorepair_max_files_var.get())))
+                        except Exception:
+                            self.global_settings["graph_rag_autorepair_max_files"] = 5
 
                 # 2.1 Сохранение настроек Аудитора
                 self.current_settings["use_main_model_for_audit"] = bool(use_main_model_checkbox.get())
@@ -7203,6 +8907,9 @@ class App(ctk.CTk):
             textbox.configure(state="normal")
             textbox.delete("1.0", "end")
             textbox.insert("1.0", "\n".join(out) if out else "(нет строк под выбранные фильтры)")
+            # Автоскролл к свежим записям: лог пишется "новые внизу", при пересоздании
+            # содержимого (refresh раз в 3 с) прокрутка сбрасывалась на верх окна
+            textbox.see("end")
             textbox.configure(state="disabled")
 
         def auto_refresh_loop():
@@ -7690,6 +9397,20 @@ class App(ctk.CTk):
             {
                 "type": "function",
                 "function": {
+                    "name": "read_file_comments",
+                    "description": "Возвращает комментарии/примечания из прикрепленного файла (docx/xlsx/.doc/.rtf). Если в тексте вложения есть системная метка о найденных комментариях — сначала явно спроси у пользователя разрешение на их чтение и вызывай этот инструмент ТОЛЬКО после положительного ответа.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string", "description": "Имя прикрепленного файла (точно как в системном промпте)."}
+                        },
+                        "required": ["filename"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "execute_python_code",
                     "description": "Выполняет Python код. Используется для анализа Excel файлов с помощью pandas. Возвращает stdout. Путь к прикреплённому файлу берите строго из системного промпта — файл уже локален, не используйте сетевые пути без прямой необходимости.",
                     "parameters": {
@@ -7894,8 +9615,14 @@ class App(ctk.CTk):
             return draft_meeting_tool(args.get("to_name"), args.get("subject"), args.get("body"), args.get("duration_minutes", 60))
         elif func_name == "read_attached_file":
             filename = args.get("filename", "")
-            if filename in getattr(self, "chat_attachments_dict", {}):
-                content = self.chat_attachments_dict[filename]
+            # D-2026-09-18-04: нормализованное сопоставление имён (NFC/пробелы/регистр/ё) —
+            # модель воспроизводит имя не всегда байт-в-байт (особенно NFD-имена с U+0306)
+            matched_key = next(
+                (k for k in getattr(self, "chat_attachments_dict", {}) if _norm_filename(k) == _norm_filename(filename)),
+                None
+            )
+            if matched_key is not None:
+                content = self.chat_attachments_dict[matched_key]
                 
                 # Проверяем, является ли это аудиофайлом, ожидающим транскрибации
                 if isinstance(content, str) and content.startswith("[AUDIO_PENDING_PATH]:"):
@@ -7953,23 +9680,68 @@ class App(ctk.CTk):
                     if not transcribed_text and parser_result and len(str(parser_result)) > 50:
                         transcribed_text = str(parser_result)
                         
-                    # 6. КЭШИРОВАНИЕ В ПАМЯТИ: Заменяем маркер на готовый текст
+                    # 6. КЭШИРОВАНИЕ В ПАМЯТИ: Заменяем маркер на готовый текст (writeback в найденный ключ,
+                    # а не в присланное моделью имя — иначе в dict появится ключ-фантом и второй чип)
                     if transcribed_text and transcribed_text.strip():
-                        self.chat_attachments_dict[filename] = transcribed_text
+                        self.chat_attachments_dict[matched_key] = transcribed_text
                         content = transcribed_text
                         self.append_to_chat(f"\n[✅ Система: Транскрипция завершена. Документ сохранен рядом с исходным файлом. Текст загружен в память Агента.]\n\n", "system")
                     else:
                         content = f"Ошибка: Транскрибация прошла, но не удалось извлечь текст для памяти. Ответ парсера: {parser_result}"
-                        self.chat_attachments_dict[filename] = content
+                        self.chat_attachments_dict[matched_key] = content
                         
                 return content
-            return f"Ошибка: Файл '{filename}' не найден во вложениях."
+            available = ", ".join(getattr(self, "chat_attachments_dict", {}).keys())
+            log_llm.warning("read_attached_file: промах по имени (запрос=%s); вложения: %s",
+                            _mask_secrets(str(filename)), _mask_secrets(available or "нет"))
+            return (f"Ошибка: Файл '{filename}' не найден во вложениях. "
+                    f"Доступные вложения: {available or 'нет'}. "
+                    f"Вызови инструмент повторно, передав точное имя файла из этого списка.")
+        elif func_name == "read_file_comments":
+            # D-2026-09-20-05: чтение комментариев вложения — только по явному вызову
+            # после согласия пользователя (контролируется маркером в тексте вложения и схемой)
+            filename = args.get("filename", "")
+            matched_key = next(
+                (k for k in getattr(self, "chat_attachments_dict", {}) if _norm_filename(k) == _norm_filename(filename)),
+                None
+            )
+            if matched_key is None:
+                # Удалённое вложение автоматически «не читается» — резолвим по актуальному dict
+                available = ", ".join(getattr(self, "chat_attachments_dict", {}).keys())
+                return (f"Ошибка: Файл '{filename}' не найден во вложениях. "
+                        f"Доступные вложения: {available or 'нет'}.")
+            block = getattr(self, "chat_attachment_comments", {}).get(matched_key)
+            if not block:
+                return f"Комментариев в файле '{matched_key}' не найдено."
+            return block
         elif func_name == "execute_python_code":
             return self.execute_python_code(args.get("code", ""))
         else: return f"Ошибка: Инструмент не найден."
 
     # ==================== АГЕНТНЫЙ ЦИКЛ ====================
+    def _set_send_mode(self, busy):
+        try:
+            if busy:
+                if not hasattr(self, "_send_btn_default_color"):
+                    self._send_btn_default_color = self.send_button.cget("fg_color")
+                self.send_button.configure(text="⏹", fg_color="#a13333", command=self.stop_agent)
+            else:
+                default_color = getattr(self, "_send_btn_default_color", None)
+                if default_color:
+                    self.send_button.configure(text="➤", fg_color=default_color, command=self.send_message)
+                else:
+                    self.send_button.configure(text="➤", command=self.send_message)
+        except Exception as e:
+            log_core.warning("_set_send_mode: не удалось переключить кнопку отправки: %s", e)
+
+    def stop_agent(self):
+        self.agent_stop_event.set()
+        self.append_to_chat("\n[⏹ Остановка запрошена — завершаю текущий шаг...]\n\n", "system")
+
     def send_message(self):
+        if getattr(self, "agent_busy", False):
+            self.append_to_chat("\n[⏹ Агент ещё отвечает — дождитесь ответа или нажмите ⏹]\n\n", "system")
+            return
         user_text = self.input_entry.get("1.0", "end-1c").strip()
         if not user_text: return
         
@@ -8038,7 +9810,7 @@ class App(ctk.CTk):
             "ШАГ 7. КОММУНИКАЦИЯ (OUTLOOK): Если после аудита, записи в журнал или генерации отчета тебе нужно оповестить коллег или назначить разбор полетов, ВЫЗОВИ 'draft_email' (для писем с красивым HTML) или 'draft_meeting' (для встреч строгим плоским текстом). Если email адресата не указан явно, пиши просто ФИО.\n"
             "ШАГ 8. БЕСКОНЕЧНАЯ ПАМЯТЬ: Ты помнишь только последние 20 сообщений. Если пользователь ссылается на старые детали диалога, которых нет в текущей истории, ВЫЗОВИ инструмент 'recall_past_conversation'. НЕ используй его для поиска стандартов (для этого есть 'search_smk_knowledge_base').\n"
             "ШАГ 9. КЛИКАБЕЛЬНЫЕ ССЫЛКИ НА ФАЙЛЫ И XWIKI: Если ты упоминаешь документ СМК, нашел его через поиск или даешь ссылку на веб-страницу XWiki, ОБЯЗАТЕЛЬНО выводи её в строгом формате: [Из файла: URL_или_Имя_файла]. НИКОГДА не пиши URL открытым текстом, всегда оборачивай в [Из файла: https://...]!\n"
-            "ШАГ 10. ОБРАБОТКА ВЛОЖЕНИЙ: Если в контексте или тексте документа ты видишь якорь вида [Вложение: путь_к_файлу], СТРОГО ЗАПРЕЩЕНО выдумывать или гадать о содержимом этого файла. Ты должен написать пользователю: 'К данному документу прикреплен файл <имя файла>. Хотите, я прочитаю его содержимое?'. Если пользователь отвечает согласием (да, давай, читай и т.д.), немедленно используй инструмент read_local_file, передав ему путь из якоря (например, attachments/abc123_имя_файла.doc).\n"
+            "ШАГ 10. ОБРАБОТКА ВЛОЖЕНИЙ: Если в контексте или тексте документа ты видишь якорь вида [Вложение: путь_к_файлу], СТРОГО ЗАПРЕЩЕНО выдумывать или гадать о содержимом этого файла. Ты должен написать пользователю: 'К данному документу прикреплен файл <имя файла>. Хотите, я прочитаю его содержимое?'. Если пользователь отвечает согласием (да, давай, читай и т.д.), немедленно используй инструмент read_local_file, передав ему путь из якоря (например, attachments/abc123_имя_файла.doc). Имя файла передавайте ТОЛЬКО как в якоре [Вложение: ...] или как в списке tool 'list_available_files'; НЕ реконструируйте URL вики и не исправляйте имя наугад — read_local_file сам разрешит имя в фактический файл и подскажет корректное написание.\n"
         )
 
         # --- КОНТРОЛЬ АВТОНОМНОГО ЧТЕНИЯ ---
@@ -8070,286 +9842,392 @@ class App(ctk.CTk):
             for v in getattr(self, "chat_attachments_dict", {}).values()
         )
         
-        for step in range(excel_params['max_iters']):
-            try:
-                start_index = self.chat_textbox.index("end-1c")
-                if getattr(self, "current_role", "guest") == "admin":
-                    current_model = self.current_settings.get("admin_model", "openai/gpt-4o-mini")
-                else:
-                    current_model = self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free")
-                
-                create_params = {
-                    "model": current_model,
-                    "messages": messages_for_llm,
-                    "tools": self.get_tools_schema(),
-                    "stream": True
-                }
-                if has_excel_context:
-                    create_params["temperature"] = excel_params["temperature"]
-                    if excel_params["reasoning_effort"] != "Отключено":
-                        create_params["reasoning_effort"] = excel_params["reasoning_effort"]
-                
-                max_retries = 3
-                t_call = time.time()
-                for retry in range(max_retries):
-                    try:
-                        response = get_llm_client().chat.completions.create(**create_params)
-                        break
-                    except Exception as api_err:
-                        if retry < max_retries - 1 and ("429" in str(api_err) or "rate" in str(api_err).lower()):
-                            import time as _time
-                            wait_time = (2 ** retry) + 1
-                            log_llm.warning("agent_loop: %s, ретрай %d/%d через %d c (model=%s)",
-                                            _classify_net_error(api_err), retry + 1, max_retries, wait_time, current_model)
-                            self.after(0, self.append_to_chat, f"\n[⏳ Rate limit. Ожидание {wait_time}с...]\n")
-                            _time.sleep(wait_time)
-                        else:
-                            raise
-                log_llm.info("agent_loop: model=%s, latency=%.2fs, status=ok, step=%d",
-                             current_model, time.time() - t_call, step)
-                # DEBUG: превью последнего user-сообщения (НЕ системный промпт, НЕ документы)
+        excel_mode = has_excel_context
+        max_steps = excel_params['max_iters'] if excel_mode else int(self.current_settings.get("agent_max_steps", 25))
+        if not excel_mode:
+            messages_for_llm[0]["content"] += (
+                "\n\n[ЭФФЕКТИВНОСТЬ]: Если нужно выполнить несколько независимых вызовов инструментов "
+                "(несколько поисков по базе, чтение нескольких файлов и т.п.), объединяй их в ОДИН шаг — "
+                "отправляй несколько tool-вызовов параллельно в одном сообщении, чтобы экономить шаги цикла.")
+
+        self.agent_stop_event.clear()
+        run_log = []
+        stopped = False
+        loop_counts = {}
+
+        self.agent_busy = True
+        self.after(0, lambda: self._set_send_mode(True))
+        try:
+            for step in range(max_steps):
+                stopped_mid_stream = False
+                loop_forced = False
+                if self.agent_stop_event.is_set():
+                    stopped = True
+                    break
+                if not excel_mode and step == max_steps - 2:
+                    messages_for_llm.append({
+                        "role": "user",
+                        "content": "[СИСТЕМНОЕ УКАЗАНИЕ] Осталось 2 шага до лимита цикла. Сгруппируй оставшиеся проверки (по возможности — параллельными tool-вызовами в одном шаге) и готовься выдать финальный ответ."
+                    })
                 try:
-                    _last_user = next((m.get("content", "") for m in reversed(messages_for_llm)
-                                       if m.get("role") == "user"), "")
-                    log_llm.debug("agent_loop: user-превью: %s", _mask_secrets(str(_last_user)[:500]))
-                except Exception:
-                    pass
+                    start_index = self.chat_textbox.index("end-1c")
+                    if getattr(self, "current_role", "guest") == "admin":
+                        current_model = self.current_settings.get("admin_model", "openai/gpt-4o-mini")
+                    else:
+                        current_model = self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free")
+                
+                    create_params = {
+                        "model": current_model,
+                        "messages": messages_for_llm,
+                        "tools": self.get_tools_schema(),
+                        "stream": True
+                    }
+                    # Температура: Excel-ползунок (при Excel-контексте) → глобальный ползунок «Базовая Температура»
+                    if has_excel_context:
+                        create_params["temperature"] = excel_params["temperature"]
+                    else:
+                        create_params["temperature"] = float(self.current_settings.get("api_temperature", 0.7))
 
-                content_parts = []
-                tool_calls_acc = {}
+                    # Приоритет effort: Excel-настройка (при Excel-контексте) → глобальная api_reasoning
+                    effort = None
+                    if has_excel_context and excel_params["reasoning_effort"] != "Отключено":
+                        effort = excel_params["reasoning_effort"]
+                    elif self.current_settings.get("api_reasoning", "Отключено") != "Отключено":
+                        effort = self.current_settings.get("api_reasoning")
 
-                for chunk in response:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-
-                    if delta.content is not None:
-                        content_parts.append(delta.content)
-                        # Накапливаем текст и очищаем от MSG_ID паттерна для отображения
-                        accumulated_step_text = "".join(content_parts)
-                        cleaned = MSG_ID_PATTERN.sub('', accumulated_step_text).strip()
-                        def update_text():
-                            self.chat_textbox.configure(state="normal")
-                            self.chat_textbox.delete(start_index, "end-1c")
-                            self.chat_textbox.insert(start_index, cleaned)
-                            self.chat_textbox.see("end")
-                            self.chat_textbox.configure(state="disabled")
-                        self.after(0, update_text)
-
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            tc_index = tc.index if tc.index is not None else 0
-                            if tc_index not in tool_calls_acc:
-                                tool_calls_acc[tc_index] = {
-                                    "id": tc.id or f"tool_call_{tc_index}",
-                                    "type": tc.type or "function",
-                                    "function": {"name": "", "arguments": ""}
-                                }
-
-                            current_tc = tool_calls_acc[tc_index]
-
-                            if tc.id:
-                                current_tc["id"] = tc.id
-                            if tc.type:
-                                current_tc["type"] = tc.type
-                            if tc.function:
-                                if tc.function.name:
-                                    current_tc["function"]["name"] += tc.function.name
-                                if tc.function.arguments:
-                                    current_tc["function"]["arguments"] += tc.function.arguments
-
-                final_text = "".join(content_parts)
-                merged_tool_calls = [tool_calls_acc[idx] for idx in sorted(tool_calls_acc.keys())]
-
-                assistant_message = {"role": "assistant"}
-                if final_text:
-                    assistant_message["content"] = final_text
-                if merged_tool_calls:
-                    assistant_message["tool_calls"] = merged_tool_calls
-
-                # DEEPSEEK PATCH: Сохраняем reasoning_content в messages
-                try:
-                    raw_msg = response.model_dump().get('choices', [{}])[0].get('message', {}) if hasattr(response, 'model_dump') else {}
-                    if isinstance(raw_msg, dict) and raw_msg.get('reasoning_content'):
-                        assistant_message["reasoning_content"] = raw_msg["reasoning_content"]
-                except Exception:
-                    pass
-
-                messages_for_llm.append(assistant_message)
-
-                if not merged_tool_calls:
-                    # Очищаем финальный текст от MSG_ID паттерна перед сохранением
-                    cleaned_final = MSG_ID_PATTERN.sub('', final_text).strip()
-                    draft_answer = cleaned_final  # Сохраняем черновик до возможного аудита
-
-                    # --- Собираем контекст из результатов Tool Calls для аудитора ---
-                    gathered_context = ""
-                    for msg in messages_for_llm:
-                        if msg.get("role") == "tool":
-                            gathered_context += msg.get("content", "") + "\n"
-
-                    # --- Извлекаем изначальный вопрос пользователя из истории ---
-                    prompt_text = ""
-                    for msg in reversed(self.chat_history):
-                        if msg.get("role") == "user":
-                            prompt_text = msg.get("content", "")
-                            break
-
-                    # --- Глубокий аудит (Рефлексия) ---
-                    if self.current_settings.get("deep_audit_enabled", False):
-                        # Выводим временное сообщение об аудите
-                        audit_marker = "\n🕵️‍♂️ Провожу глубокий аудит ответа...\n"
-                        self.append_to_chat(audit_marker)
-
+                    # Гард по карте: отправляем только уровни, поддерживаемые моделью
+                    if effort:
+                        info = self.get_model_reasoning_info(current_model)
+                        if self.model_reasoning_map and info is None:
+                            effort = None        # модель не reasoning — не отправляем
+                        elif info and info["efforts"] and effort not in info["efforts"]:
+                            # Уровень моделью не поддерживается — не отправляем.
+                            # Без тихого fallback на глобальное значение (сознательное решение).
+                            effort = None
+                        # карта пустая (offline/первый запуск) или efforts is None → отправляем как есть
+                    if effort:
+                        # extra_body — совместимо с любой версией openai SDK (рекомендованный формат OpenRouter)
+                        create_params["extra_body"] = {"reasoning": {"effort": effort}}
+                    log_llm.info("agent_loop: params: temperature=%s, effort=%s (model=%s)",
+                                 create_params.get("temperature"), effort or "—", current_model)
+                
+                    max_retries = 3
+                    t_call = time.time()
+                    for retry in range(max_retries):
                         try:
-                            # Вызов аудитора (синхронный, в текущем потоке agent_loop)
-                            final_answer = self.run_deep_audit(prompt_text, draft_answer, gathered_context)
+                            response = get_llm_client().chat.completions.create(**create_params)
+                            break
+                        except Exception as api_err:
+                            if retry < max_retries - 1 and ("429" in str(api_err) or "rate" in str(api_err).lower()):
+                                import time as _time
+                                wait_time = (2 ** retry) + 1
+                                log_llm.warning("agent_loop: %s, ретрай %d/%d через %d c (model=%s)",
+                                                _classify_net_error(api_err), retry + 1, max_retries, wait_time, current_model)
+                                self.after(0, self.append_to_chat, f"\n[⏳ Rate limit. Ожидание {wait_time}с...]\n")
+                                for _wait_sec in range(wait_time):
+                                    if self.agent_stop_event.is_set():
+                                        stopped = True
+                                        break
+                                    _time.sleep(1)
+                                if stopped:
+                                    break
+                            else:
+                                raise
+                    if stopped:
+                        break
+                    log_llm.info("agent_loop: model=%s, latency=%.2fs, status=ok, step=%d",
+                                 current_model, time.time() - t_call, step)
+                    # DEBUG: превью последнего user-сообщения (НЕ системный промпт, НЕ документы)
+                    try:
+                        _last_user = next((m.get("content", "") for m in reversed(messages_for_llm)
+                                           if m.get("role") == "user"), "")
+                        log_llm.debug("agent_loop: user-превью: %s", _mask_secrets(str(_last_user)[:500]))
+                    except Exception:
+                        pass
 
-                            # Удаляем временное сообщение из чата
-                            self.chat_textbox.configure(state="normal")
-                            current_text = self.chat_textbox.get("1.0", "end-1c")
-                            if current_text.endswith(audit_marker.rstrip()):
-                                # Удаляем последнюю строку с маркером
+                    content_parts = []
+                    tool_calls_acc = {}
+
+                    for chunk in response:
+                        if self.agent_stop_event.is_set() and not tool_calls_acc:
+                            stopped_mid_stream = True
+                            try:
+                                response.close()
+                            except Exception:
+                                pass
+                            break
+                        if not chunk.choices:
+                            continue
+                        delta = chunk.choices[0].delta
+
+                        if delta.content is not None:
+                            content_parts.append(delta.content)
+                            # Накапливаем текст и очищаем от MSG_ID паттерна для отображения
+                            accumulated_step_text = "".join(content_parts)
+                            cleaned = MSG_ID_PATTERN.sub('', accumulated_step_text).strip()
+                            def update_text():
+                                self.chat_textbox.configure(state="normal")
+                                self.chat_textbox.delete(start_index, "end-1c")
+                                self.chat_textbox.insert(start_index, cleaned)
+                                self.chat_textbox.see("end")
+                                self.chat_textbox.configure(state="disabled")
+                            self.after(0, update_text)
+
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                tc_index = tc.index if tc.index is not None else 0
+                                if tc_index not in tool_calls_acc:
+                                    tool_calls_acc[tc_index] = {
+                                        "id": tc.id or f"tool_call_{tc_index}",
+                                        "type": tc.type or "function",
+                                        "function": {"name": "", "arguments": ""}
+                                    }
+
+                                current_tc = tool_calls_acc[tc_index]
+
+                                if tc.id:
+                                    current_tc["id"] = tc.id
+                                if tc.type:
+                                    current_tc["type"] = tc.type
+                                if tc.function:
+                                    if tc.function.name:
+                                        current_tc["function"]["name"] += tc.function.name
+                                    if tc.function.arguments:
+                                        current_tc["function"]["arguments"] += tc.function.arguments
+
+                    final_text = "".join(content_parts)
+                    merged_tool_calls = [tool_calls_acc[idx] for idx in sorted(tool_calls_acc.keys())]
+
+                    if stopped_mid_stream:
+                        if final_text:
+                            messages_for_llm.append({"role": "assistant", "content": final_text})
+                        stopped = True
+                        break
+
+                    assistant_message = {"role": "assistant"}
+                    if final_text:
+                        assistant_message["content"] = final_text
+                    if merged_tool_calls:
+                        assistant_message["tool_calls"] = merged_tool_calls
+
+                    # DEEPSEEK PATCH: Сохраняем reasoning_content в messages
+                    try:
+                        raw_msg = response.model_dump().get('choices', [{}])[0].get('message', {}) if hasattr(response, 'model_dump') else {}
+                        if isinstance(raw_msg, dict) and raw_msg.get('reasoning_content'):
+                            assistant_message["reasoning_content"] = raw_msg["reasoning_content"]
+                    except Exception:
+                        pass
+
+                    messages_for_llm.append(assistant_message)
+
+                    if not merged_tool_calls:
+                        # Очищаем финальный текст от MSG_ID паттерна перед сохранением
+                        cleaned_final = MSG_ID_PATTERN.sub('', final_text).strip()
+                        draft_answer = cleaned_final  # Сохраняем черновик до возможного аудита
+
+                        # --- Собираем контекст из результатов Tool Calls для аудитора ---
+                        gathered_context = ""
+                        for msg in messages_for_llm:
+                            if msg.get("role") == "tool":
+                                gathered_context += msg.get("content", "") + "\n"
+
+                        # --- Извлекаем изначальный вопрос пользователя из истории ---
+                        prompt_text = ""
+                        for msg in reversed(self.chat_history):
+                            if msg.get("role") == "user":
+                                prompt_text = msg.get("content", "")
+                                break
+
+                        # --- Глубокий аудит (Рефлексия) ---
+                        if self.current_settings.get("deep_audit_enabled", False):
+                            # Выводим временное сообщение об аудите
+                            audit_marker = "\n🕵️‍♂️ Провожу глубокий аудит ответа...\n"
+                            self.append_to_chat(audit_marker)
+
+                            try:
+                                # Вызов аудитора (синхронный, в текущем потоке agent_loop)
+                                final_answer = self.run_deep_audit(prompt_text, draft_answer, gathered_context)
+
+                                # Удаляем временное сообщение из чата
+                                self.chat_textbox.configure(state="normal")
+                                current_text = self.chat_textbox.get("1.0", "end-1c")
+                                if current_text.endswith(audit_marker.rstrip()):
+                                    # Удаляем последнюю строку с маркером
+                                    lines = current_text.rsplit("\n🕵️‍♂️ Провожу глубокий аудит ответа...", 1)
+                                    self.chat_textbox.delete("1.0", "end-1c")
+                                    self.chat_textbox.insert("1.0", lines[0])
+                                self.chat_textbox.configure(state="disabled")
+
+                                # Заменяем текст черновика на аудитный в чате
+                                self.chat_textbox.configure(state="normal")
+                                self.chat_textbox.delete(start_index, "end-1c")
+                                self.chat_textbox.insert(start_index, final_answer)
+                                self.chat_textbox.insert("end", "\n\n")
+                                self.chat_textbox.see("end")
+                                self.chat_textbox.configure(state="disabled")
+                                self.apply_markdown(start_index)
+                                self.after(0, self.highlight_attachments)
+
+                                # Сохраняем аудитный ответ в историю
+                                self.chat_history.append({"role": "assistant", "content": final_answer, "_msg_id": agent_msg_id})
+
+                            except Exception as audit_err:
+                                # --- Graceful Fallback (ШАГ 5) ---
+                                log_llm.error("Deep Audit: ошибка аудитора (%s): %s",
+                                              _classify_net_error(audit_err), _mask_secrets(audit_err))
+
+                                # Удаляем временное сообщение из чата
+                                self.chat_textbox.configure(state="normal")
+                                current_text = self.chat_textbox.get("1.0", "end-1c")
                                 lines = current_text.rsplit("\n🕵️‍♂️ Провожу глубокий аудит ответа...", 1)
                                 self.chat_textbox.delete("1.0", "end-1c")
                                 self.chat_textbox.insert("1.0", lines[0])
-                            self.chat_textbox.configure(state="disabled")
+                                self.chat_textbox.configure(state="disabled")
 
-                            # Заменяем текст черновика на аудитный в чате
+                                # Выводим черновик + предупреждение
+                                fallback_answer = draft_answer + "\n\n*(Внимание: глубокий аудит недоступен, ответ не проверен)*"
+                                self.chat_textbox.configure(state="normal")
+                                self.chat_textbox.delete(start_index, "end-1c")
+                                self.chat_textbox.insert(start_index, fallback_answer)
+                                self.chat_textbox.insert("end", "\n\n")
+                                self.chat_textbox.see("end")
+                                self.chat_textbox.configure(state="disabled")
+                                self.apply_markdown(start_index)
+                                self.after(0, self.highlight_attachments)
+
+                                # Сохраняем комбинированный текст в историю
+                                self.chat_history.append({"role": "assistant", "content": fallback_answer, "_msg_id": agent_msg_id})
+                        else:
+                            # --- Обычный режим (без аудита) ---
                             self.chat_textbox.configure(state="normal")
-                            self.chat_textbox.delete(start_index, "end-1c")
-                            self.chat_textbox.insert(start_index, final_answer)
                             self.chat_textbox.insert("end", "\n\n")
-                            self.chat_textbox.see("end")
                             self.chat_textbox.configure(state="disabled")
                             self.apply_markdown(start_index)
                             self.after(0, self.highlight_attachments)
+                            self.chat_history.append({"role": "assistant", "content": draft_answer, "_msg_id": agent_msg_id})
 
-                            # Сохраняем аудитный ответ в историю
-                            self.chat_history.append({"role": "assistant", "content": final_answer, "_msg_id": agent_msg_id})
+                        self.save_history()
 
-                        except Exception as audit_err:
-                            # --- Graceful Fallback (ШАГ 5) ---
-                            log_llm.error("Deep Audit: ошибка аудитора (%s): %s",
-                                          _classify_net_error(audit_err), _mask_secrets(audit_err))
+                        # --- Логика вытеснения (Скользящее окно 20 сообщений = 10 пар) ---
+                        if len(self.chat_history) > 20:
+                            old_user = self.chat_history.pop(0)
+                            old_assist = self.chat_history.pop(0)
 
-                            # Удаляем временное сообщение из чата
-                            self.chat_textbox.configure(state="normal")
-                            current_text = self.chat_textbox.get("1.0", "end-1c")
-                            lines = current_text.rsplit("\n🕵️‍♂️ Провожу глубокий аудит ответа...", 1)
-                            self.chat_textbox.delete("1.0", "end-1c")
-                            self.chat_textbox.insert("1.0", lines[0])
-                            self.chat_textbox.configure(state="disabled")
+                            # Сохраняем в векторную базу ТОЛЬКО для Админа
+                            if getattr(self, "current_role", "guest") == "admin":
+                                try:
+                                    archive_text = (
+                                        f"[MSG_ID: {old_user.get('_msg_id', '?')}] Пользователь: {old_user.get('content', '')}\n"
+                                        f"[MSG_ID: {old_assist.get('_msg_id', '?')}] Ассистент: {old_assist.get('content', '')}"
+                                    )
+                                    client = chromadb.PersistentClient(path=get_db_path())
+                                    collection = client.get_or_create_collection(name="temp_chat_memory", embedding_function=get_cloud_ef())
+                                    collection.add(
+                                        documents=[archive_text],
+                                        metadatas=[{"session_id": self.current_session_id}],
+                                        ids=[str(uuid.uuid4())]
+                                    )
+                                except Exception as e:
+                                    log_rag.error("Ошибка архивации чата (%s): %s", _classify_net_error(e), e)
 
-                            # Выводим черновик + предупреждение
-                            fallback_answer = draft_answer + "\n\n*(Внимание: глубокий аудит недоступен, ответ не проверен)*"
-                            self.chat_textbox.configure(state="normal")
-                            self.chat_textbox.delete(start_index, "end-1c")
-                            self.chat_textbox.insert(start_index, fallback_answer)
-                            self.chat_textbox.insert("end", "\n\n")
-                            self.chat_textbox.see("end")
-                            self.chat_textbox.configure(state="disabled")
-                            self.apply_markdown(start_index)
-                            self.after(0, self.highlight_attachments)
+                        self.save_current_session()
+                        break
 
-                            # Сохраняем комбинированный текст в историю
-                            self.chat_history.append({"role": "assistant", "content": fallback_answer, "_msg_id": agent_msg_id})
+                    for tool_call in merged_tool_calls:
+                        func_name = tool_call.get("function", {}).get("name", "")
+                        args_raw = tool_call.get("function", {}).get("arguments", "{}")
+
+                        try:
+                            args = json.loads(args_raw) if args_raw else {}
+                        except Exception:
+                            args = {}
+
+                        run_log.append((func_name, args))
+                        if not excel_mode:
+                            call_key = (func_name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+                            loop_counts[call_key] = loop_counts.get(call_key, 0) + 1
+                            if loop_counts[call_key] == 2:
+                                messages_for_llm.append({
+                                    "role": "user",
+                                    "content": f"[СИСТЕМНОЕ УКАЗАНИЕ] Ты повторяешь тот же вызов '{func_name}' с теми же аргументами. Измени формулировку запроса или переходи к финальному ответу."
+                                })
+                                self.after(0, self.append_to_chat, "\n[⚠️ Одинаковый вызов инструмента повторяется — Агенту отправлено предупреждение]\n", "system")
+                            elif loop_counts[call_key] >= 3:
+                                loop_forced = True
+
+                        # Выводим аккуратный лог действия с отступом, БЕЗ дублирования бейджа
+                        self.after(0, self.append_to_chat, f"  ⚙️ [Действие: {func_name}]...\n", "tool_call")
+                        if func_name == "execute_python_code":
+                            self.after(0, lambda: self.append_to_chat("\n[⏳ Агент анализирует данные Excel и выполняет вычисления...]\n"))
+                            self.after(0, self.update_idletasks)
+
+                        # Особая обработка поиска по базе знаний: поддержка Rerank (Advanced RAG)
+                        if func_name == "search_smk_knowledge_base":
+                            # Собираем параметры Rerank только для Админа с включенной фичей
+                            rerank_params = None
+                            if self.current_role == "admin" and self.current_settings.get("rerank_enabled"):
+                                rerank_params = {
+                                    "enabled": True,
+                                    "provider": self.current_settings.get("rerank_provider", "OpenRouter"),
+                                    "model": self.current_settings.get("rerank_model", "cohere/rerank-4-fast"),
+                                    "top_k": self.current_settings.get("rerank_top_k", 20),
+                                    "threshold": self.current_settings.get("rerank_threshold", 0.3),
+                                    "cohere_key": get_vault_data().get("cohere_key", "")
+                                }
+                            # Функция возвращает кортеж (результат, флаг_ошибки_rerank)
+                            tool_result, fallback_triggered = search_smk_knowledge_base(args.get("query"), rerank_params)
+                            # Если Rerank упал, тихо сообщаем админу
+                            if fallback_triggered and self.current_role == "admin":
+                                self.after(0, lambda: self.append_to_chat("\n[⚠️ Rerank API недоступен. Использован базовый векторный поиск]\n", "system"))
+                        else:
+                            tool_result = self.execute_tool(func_name, args)
+                        messages_for_llm.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id", ""),
+                            "name": func_name,
+                            "content": str(tool_result)
+                        })
+
+                    if loop_forced:
+                        stopped = True
+                        break
+                     
+                except Exception as e:
+                    error_str = str(e).lower()
+                    log_llm.error("agent_loop: критическая ошибка (%s), model=%s: %s",
+                                  _classify_net_error(e),
+                                  self.current_settings.get("admin_model" if getattr(self, "current_role", "guest") == "admin" else "guest_model", ""),
+                                  _mask_secrets(e))
+                    if "context_length_exceeded" in error_str or "maximum context length" in error_str or "400" in error_str:
+                        self.append_to_chat("\n[⚠️ Ошибка: Объем прикрепленных файлов превышает лимит памяти нейросети. Пожалуйста, удалите часть файлов или разбейте документ на части.]\n\n")
                     else:
-                        # --- Обычный режим (без аудита) ---
-                        self.chat_textbox.configure(state="normal")
-                        self.chat_textbox.insert("end", "\n\n")
-                        self.chat_textbox.configure(state="disabled")
-                        self.apply_markdown(start_index)
-                        self.after(0, self.highlight_attachments)
-                        self.chat_history.append({"role": "assistant", "content": draft_answer, "_msg_id": agent_msg_id})
-
-                    self.save_history()
-
-                    # --- Логика вытеснения (Скользящее окно 20 сообщений = 10 пар) ---
-                    if len(self.chat_history) > 20:
-                        old_user = self.chat_history.pop(0)
-                        old_assist = self.chat_history.pop(0)
-
-                        # Сохраняем в векторную базу ТОЛЬКО для Админа
-                        if getattr(self, "current_role", "guest") == "admin":
-                            try:
-                                archive_text = (
-                                    f"[MSG_ID: {old_user.get('_msg_id', '?')}] Пользователь: {old_user.get('content', '')}\n"
-                                    f"[MSG_ID: {old_assist.get('_msg_id', '?')}] Ассистент: {old_assist.get('content', '')}"
-                                )
-                                client = chromadb.PersistentClient(path=get_db_path())
-                                collection = client.get_or_create_collection(name="temp_chat_memory", embedding_function=get_cloud_ef())
-                                collection.add(
-                                    documents=[archive_text],
-                                    metadatas=[{"session_id": self.current_session_id}],
-                                    ids=[str(uuid.uuid4())]
-                                )
-                            except Exception as e:
-                                log_rag.error("Ошибка архивации чата (%s): %s", _classify_net_error(e), e)
-
+                        self.append_to_chat(f"\n[Критическая ошибка Агента: {str(e)}]\n\n")
                     self.save_current_session()
                     break
-
-                for tool_call in merged_tool_calls:
-                    func_name = tool_call.get("function", {}).get("name", "")
-                    args_raw = tool_call.get("function", {}).get("arguments", "{}")
-
-                    try:
-                        args = json.loads(args_raw) if args_raw else {}
-                    except Exception:
-                        args = {}
-
-                    # Выводим аккуратный лог действия с отступом, БЕЗ дублирования бейджа
-                    self.after(0, self.append_to_chat, f"  ⚙️ [Действие: {func_name}]...\n", "tool_call")
-                    if func_name == "execute_python_code":
-                        self.after(0, lambda: self.append_to_chat("\n[⏳ Агент анализирует данные Excel и выполняет вычисления...]\n"))
-                        self.after(0, self.update_idletasks)
-
-                    # Особая обработка поиска по базе знаний: поддержка Rerank (Advanced RAG)
-                    if func_name == "search_smk_knowledge_base":
-                        # Собираем параметры Rerank только для Админа с включенной фичей
-                        rerank_params = None
-                        if self.current_role == "admin" and self.current_settings.get("rerank_enabled"):
-                            rerank_params = {
-                                "enabled": True,
-                                "provider": self.current_settings.get("rerank_provider", "OpenRouter"),
-                                "model": self.current_settings.get("rerank_model", "cohere/rerank-4-fast"),
-                                "top_k": self.current_settings.get("rerank_top_k", 20),
-                                "threshold": self.current_settings.get("rerank_threshold", 0.3),
-                                "cohere_key": get_vault_data().get("cohere_key", "")
-                            }
-                        # Функция возвращает кортеж (результат, флаг_ошибки_rerank)
-                        tool_result, fallback_triggered = search_smk_knowledge_base(args.get("query"), rerank_params)
-                        # Если Rerank упал, тихо сообщаем админу
-                        if fallback_triggered and self.current_role == "admin":
-                            self.after(0, lambda: self.append_to_chat("\n[⚠️ Rerank API недоступен. Использован базовый векторный поиск]\n", "system"))
-                    else:
-                        tool_result = self.execute_tool(func_name, args)
-                    messages_for_llm.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.get("id", ""),
-                        "name": func_name,
-                        "content": str(tool_result)
-                    })
-                     
-            except Exception as e:
-                error_str = str(e).lower()
-                log_llm.error("agent_loop: критическая ошибка (%s), model=%s: %s",
-                              _classify_net_error(e),
-                              self.current_settings.get("admin_model" if getattr(self, "current_role", "guest") == "admin" else "guest_model", ""),
-                              _mask_secrets(e))
-                if "context_length_exceeded" in error_str or "maximum context length" in error_str or "400" in error_str:
-                    self.append_to_chat("\n[⚠️ Ошибка: Объем прикрепленных файлов превышает лимит памяти нейросети. Пожалуйста, удалите часть файлов или разбейте документ на части.]\n\n")
+            else:
+                if excel_mode:
+                    warning_msg = f"⚠️ ИИ-Агент: Достигнут лимит вычислений ({excel_params['max_iters']} шагов). Задача слишком сложная, либо я не могу найти решение. Пожалуйста, уточните запрос или упростите задачу."
+                    self.append_to_chat(f"\n{warning_msg}\n\n")
+                    self.chat_history.append({"role": "assistant", "content": warning_msg})
+                    self.save_history()
+                    self.save_current_session()
                 else:
-                    self.append_to_chat(f"\n[Критическая ошибка Агента: {str(e)}]\n\n")
-                self.save_current_session()
-                break
-        else:
-            warning_msg = f"⚠️ ИИ-Агент: Достигнут лимит вычислений ({excel_params['max_iters']} шагов). Задача слишком сложная, либо я не могу найти решение. Пожалуйста, уточните запрос или упростите задачу."
-            self.append_to_chat(f"\n{warning_msg}\n\n")
-            self.chat_history.append({"role": "assistant", "content": warning_msg})
-            self.save_history()
-            self.save_current_session()
+                    self._agent_finalize(f"Лимит шагов исчерпан ({max_steps})", messages_for_llm, run_log, agent_msg_id)
+
+            if stopped:
+                if excel_mode:
+                    steps_done = sum(1 for m in messages_for_llm if m.get("role") == "assistant")
+                    stop_note = (f"⏹ Остановлено пользователем (выполнено шагов цикла: {steps_done}).\n"
+                                 f"Механическая сводка забега:\n{self._agent_summary_text(run_log, steps_done=steps_done)}")
+                    self.append_to_chat(f"\n{stop_note}\n\n")
+                    self.chat_history.append({"role": "assistant", "content": stop_note})
+                    self.save_history()
+                    self.save_current_session()
+                else:
+                    self._agent_finalize("Остановлено пользователем", messages_for_llm, run_log, agent_msg_id)
+        finally:
+            self.agent_busy = False
+            self.after(0, lambda: self._set_send_mode(False))
         
         # Подсвечиваем ссылки вложений после ответа Агента
         self.after(0, self.highlight_attachments)
@@ -8357,6 +10235,112 @@ class App(ctk.CTk):
         # Выбираем последние 4 сообщения для контекста
         recent_msgs = self.chat_history[-4:]
         threading.Thread(target=self.run_background_secretary, args=(recent_msgs,), daemon=True).start()
+
+    def _agent_summary_text(self, run_log, steps_done=None):
+        if not run_log:
+            return "  (инструменты не вызывались)"
+        lines = []
+        seen = set()
+        for func_name, args in run_log:
+            args_str = json.dumps(args, sort_keys=True, ensure_ascii=False)
+            key = (func_name, args_str)
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(args_str) > 120:
+                args_str = args_str[:117] + "..."
+            lines.append(f"  • {func_name}: {args_str}")
+        if steps_done is not None:
+            lines.append(f"  Выполнено шагов цикла: {steps_done}")
+        return "\n".join(lines)
+
+    def _agent_finalize(self, reason, messages_for_llm, run_log, agent_msg_id):
+        try:
+            has_tool_results = any(m.get("role") == "tool" for m in messages_for_llm)
+            if not run_log and not has_tool_results:
+                note = "⏹ Остановлено до начала поиска."
+                self.append_to_chat(f"\n{note}\n\n")
+                self.chat_history.append({"role": "assistant", "content": note, "_msg_id": agent_msg_id})
+                self.save_history()
+                self.save_current_session()
+                return
+
+            steps_done = sum(1 for m in messages_for_llm if m.get("role") == "assistant")
+            summary = self._agent_summary_text(run_log, steps_done=steps_done)
+            self.append_to_chat(f"\n📋 {reason}. Механическая сводка забега:\n{summary}\n")
+
+            messages_for_llm.append({
+                "role": "user",
+                "content": (
+                    f"[СИСТЕМНОЕ УКАЗАНИЕ] {reason}. Инструменты больше недоступны. "
+                    "На основе ВСЕХ собранных выше результатов инструментов выдай максимально полный "
+                    "финальный ответ на исходный вопрос пользователя. В конце добавь блок "
+                    "'Что осталось непроверенным:' — перечисли, какие проверки ты не успел выполнить."
+                )
+            })
+
+            if getattr(self, "current_role", "guest") == "admin":
+                current_model = self.current_settings.get("admin_model", "openai/gpt-4o-mini")
+            else:
+                current_model = self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free")
+
+            self.append_to_chat("\n🧩 Финальный ответ (собран по частичным данным):\n")
+            create_params = {
+                "model": current_model,
+                "messages": messages_for_llm,
+                "stream": True,
+                "temperature": float(self.current_settings.get("api_temperature", 0.7)),
+            }
+            synthesis_parts = []
+            start_index = self.chat_textbox.index("end-1c")
+            response = get_llm_client().chat.completions.create(**create_params)
+            for chunk in response:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content is not None:
+                    synthesis_parts.append(delta.content)
+                    synthesized = MSG_ID_PATTERN.sub('', "".join(synthesis_parts)).strip()
+
+                    def update_text():
+                        self.chat_textbox.configure(state="normal")
+                        self.chat_textbox.delete(start_index, "end-1c")
+                        self.chat_textbox.insert(start_index, synthesized)
+                        self.chat_textbox.see("end")
+                        self.chat_textbox.configure(state="disabled")
+
+                    self.after(0, update_text)
+
+            final_answer = MSG_ID_PATTERN.sub('', "".join(synthesis_parts)).strip()
+            if final_answer:
+                display_text = final_answer + f"\n\n_(собран по частичным данным: {reason})_"
+            else:
+                display_text = f"_(синтез не дал текста: {reason})_"
+            self.chat_history.append({"role": "assistant", "content": display_text, "_msg_id": agent_msg_id})
+
+            def final_update():
+                self.chat_textbox.configure(state="normal")
+                self.chat_textbox.delete(start_index, "end-1c")
+                self.chat_textbox.insert(start_index, display_text)
+                self.chat_textbox.insert("end", "\n\n")
+                self.chat_textbox.see("end")
+                self.chat_textbox.configure(state="disabled")
+
+            self.after(0, final_update)
+            self.after(0, lambda: self.apply_markdown(start_index))
+            self.after(0, self.highlight_attachments)
+            self.save_history()
+            self.save_current_session()
+        except Exception as finalize_err:
+            log_llm.error("_agent_finalize: ошибка финализации (%s): %s",
+                          _classify_net_error(finalize_err), _mask_secrets(finalize_err))
+            try:
+                self.append_to_chat(f"\n[⚠️ Ошибка финализации ({reason}): {finalize_err}. Выше — механическая сводка собранных данных.]\n\n")
+                self.chat_history.append({"role": "assistant", "content": f"⏹ {reason}. Финализация не удалась: {finalize_err}", "_msg_id": agent_msg_id})
+                self.save_history()
+                self.save_current_session()
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     app = App()
