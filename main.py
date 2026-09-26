@@ -650,6 +650,23 @@ def init_graph_db():
                 log_graph.info("Миграция graph_rag.db: добавлена колонка relations.source_chunk (идемпотентно)")
         except Exception as e:
             log_graph.error("Миграция source_chunk не выполнена (%s): %s", _classify_net_error(e), e)
+        # Идемпотентная миграция D-2026-09-25-03 (вариант A «два поля»): дословные цитаты
+        # сущностей из текста окна — используются ТОЛЬКО для поиска чанка-якоря
+        # (verbatim-приоритет в _match_triplet_to_chunk). NULL = цитаты нет/не проверена.
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(relations)")}
+            if "source_verbatim" not in cols:
+                conn.execute("ALTER TABLE relations ADD COLUMN source_verbatim TEXT")
+                log_graph.info("Миграция graph_rag.db: добавлена колонка relations.source_verbatim (идемпотентно)")
+        except Exception as e:
+            log_graph.error("Миграция source_verbatim не выполнена (%s): %s", _classify_net_error(e), e)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(relations)")}
+            if "target_verbatim" not in cols:
+                conn.execute("ALTER TABLE relations ADD COLUMN target_verbatim TEXT")
+                log_graph.info("Миграция graph_rag.db: добавлена колонка relations.target_verbatim (идемпотентно)")
+        except Exception as e:
+            log_graph.error("Миграция target_verbatim не выполнена (%s): %s", _classify_net_error(e), e)
         conn.execute("CREATE TABLE IF NOT EXISTS processed_chunks (chunk_id TEXT PRIMARY KEY)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_source ON relations(source)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rel_target ON relations(target)")
@@ -3629,8 +3646,31 @@ def search_smk_knowledge_base(query, rerank_params=None):
             return "⏳ База знаний СМК сейчас обновляется Администратором. Пожалуйста, подождите 1-2 минуты и повторите запрос.", False
         return f"Ошибка поиска: {str(e)}", False
 
-def _parse_graph_json(raw):
-    """Робастно парсит {"relations": [[s,p,o], ...]} из ответа LLM (срезает ```json, толерантен к мусору)."""
+def _parse_graph_json(raw, source_text=None):
+    """Робастно парсит {"relations": [[s,p,o,(vs),(vo)], ...]} из ответа LLM
+    (срезает ```json, толерантен к мусору).
+    Принимает 3/4/5-элементные кортежи (5-полевой формат D-2026-09-25-03: канон сущностей
+    + дословные цитаты для якоря); недостающие/не-строковые цитаты -> "".
+    Возвращает ВСЕГДА список 5-полевых кортежей [s, p, o, vs, vo] (единый формат для потребителей).
+    source_text: текст окна (тот же user_text, что видела модель):
+    если передан НЕ-None, цитаты валидируются по тексту (_entity_in_text по нормализованным
+    формам, 0 LLM) — не найденная дословно цитата отбрасывается в "" (запишется как NULL).
+    В БД цитата хранится в исходной форме (обёртки-кавычки/многоточия срезаны)."""
+    # Обёртки-кавычки/многоточия, которые модели навешивают на цитаты по краям
+    _QUOTE_WRAPS = ("«", "»", '"', "'", "\u201e", "\u201c", "\u201d", "\u2018", "\u2019")
+    def _clean_quote(q):
+        # Исходная форма сохраняется (валидация — по нормализованной форме callers'ом)
+        while q and (q[-1] in _QUOTE_WRAPS or q[-1] == "…"):
+            q = q[:-1].rstrip()
+        while q and (q[0] in _QUOTE_WRAPS or q.startswith("…") or q.startswith("...")):
+            if q.startswith("..."):
+                q = q[3:]
+            elif q.startswith("…"):
+                q = q[1:]
+            else:
+                q = q[1:]
+            q = q.lstrip()
+        return q
     try:
         s = raw.strip()
         s = re.sub(r"^```(?:json)?", "", s).strip()
@@ -3639,10 +3679,28 @@ def _parse_graph_json(raw):
         if start == -1 or end == -1: return []
         data = json.loads(s[start:end+1])
         rels = data.get("relations", [])
+        norm_source = _norm_entity(source_text) if source_text is not None else None
         out = []
         for r in rels:
-            if isinstance(r, (list, tuple)) and len(r) >= 3:
-                out.append([str(r[0]).strip(), str(r[1]).strip(), str(r[2]).strip()])
+            if not (isinstance(r, (list, tuple)) and len(r) >= 3):
+                continue
+            def _str_field(v):
+                return str(v).strip() if isinstance(v, str) else ""
+            s_ent, p_ent, o_ent = _str_field(r[0]), _str_field(r[1]), _str_field(r[2])
+            vs, vo = (_str_field(r[3]), _str_field(r[4])) if len(r) >= 5 else \
+                     (_str_field(r[3]), "") if len(r) == 4 else ("", "")
+            # Валидация цитат: если модель прислала текст не из окна — отбрасываем в ""
+            # (NULL в БД). Проверка по нормализованным формам (lower/пробелы), в БД —
+            # исходная форма цитаты (позиционирование сниппета в _ground_graph_rows).
+            # Только при source_text не None (None = тесты/совместимость).
+            if norm_source is not None:
+                if vs:
+                    vs_clean = _clean_quote(vs)
+                    vs = vs_clean if _entity_in_text(_norm_entity(vs_clean), norm_source) else ""
+                if vo:
+                    vo_clean = _clean_quote(vo)
+                    vo = vo_clean if _entity_in_text(_norm_entity(vo_clean), norm_source) else ""
+            out.append([s_ent, p_ent, o_ent, vs, vo])
         return out
     except Exception:
         return []
@@ -3681,16 +3739,21 @@ def _check_llm_connectivity(model=None):
 _GRAPH_JSON_UNSUPPORTED = set()  # модели, не поддерживающие response_format json_object — пропускаем JSON-mode
 
 def _extract_graph_relations(text, model, cap=None, client=None, max_tokens=16000):
-    """LLM-извлечение сущностей/связей.
+    """LLM-извлечение сущностей/связей. Формат «два поля» (D-2026-09-25-03):
+    канон-имена — для дедупа узлов, дословные цитаты — для поиска чанка-якоря
+    (парсер валидирует цитаты по тексту окна, не прошедшие -> NULL).
     Возвращает кортеж (rels, finish_reason, completion_tokens):
-      rels — список [subj, pred, obj] (возможно пустой) либо None при parse-сбое (модель не выдала JSON);
+      rels — список 5-полевых кортежей [subj, pred, obj, quote_subj, quote_obj]
+             (возможно пустой) либо None при parse-сбое (модель не выдала JSON);
       finish_reason — причина завершения ('length' = ответ обрезан по лимиту max_tokens);
       completion_tokens — фактический расход выходных токенов (может быть None).
     API-сбои (403/429/conn) ПРОБРАСЫВАЮТСЯ как openai.APIStatusError/RateLimitError/APIConnectionError —
     паук маршрутизирует их (403 → пауза+диагностика, 429 → бэкофф с Retry-After)."""
     prompt = ('Извлеки сущности и связи из текста. Верни СТРОГО JSON без пояснений: '
-              '{"relations": [["Субъект","Предикат","Объект"]]}. '
-              'Сущности — короткие имена (отделы, роли, процессы, документы). Избегай местоимений и общих слов. '
+              '{"relations": [["Субъект-канон","Предикат","Объект-канон","Дословная цитата субъекта","Дословная цитата объекта"]]}. '
+              'Сущности — короткие канонические имена (отделы, роли, процессы, документы); '
+              'цитата — ДОСЛОВНЫЙ отрывок текста (до 15 слов / 120 символов), где сущность названа; '
+              'цитаты нет — пустая строка. Избегай местоимений и общих слов. '
               'Если связей нет — верни {"relations": []}.')
     cap_val = int(cap) if cap else 12000
     user_text = text[:cap_val]
@@ -3731,7 +3794,7 @@ def _extract_graph_relations(text, model, cap=None, client=None, max_tokens=1600
     log_llm.info("_extract_graph_relations: model=%s, latency=%.2fs, status=ok, prompt_tokens=%s, completion_tokens=%s, finish_reason=%s",
                  model, time.time() - t0,
                  getattr(usage, "prompt_tokens", None), completion_tokens, finish_reason)
-    parsed = _parse_graph_json(raw)
+    parsed = _parse_graph_json(raw, user_text)
     if not parsed and ("{" not in raw or "}" not in raw):
         # Модель не выдала JSON-структуру — parse-сбой, повторим окно (poison-guard потом пропустит)
         return None, finish_reason, completion_tokens
@@ -3761,32 +3824,76 @@ def _entity_in_text(norm_entity, norm_text):
         pos = norm_text.find(norm_entity, pos + 1)
     return False
 
-def _match_triplet_to_chunk(entities, chunk_texts):
+def _match_triplet_to_chunk(entities, chunk_texts, verbatims=None):
     """Детерминированный substring-матчинг триплета по чанкам. НИКАКОЙ LLM.
 
     entities: список имён сущностей [субъект, объект] (оригиналы или норм-ключи — нормализация идемпотентна).
     chunk_texts: список пар (chunk_id, text) в порядке чанков в файле.
+    verbatims: опционально [цитата_субъекта, цитата_объекта] (вариант A «два поля»,
+    D-2026-09-25-03) — дословные формы исходного текста для поиска якоря; None/пустые ->
+    только старая канон-логика (обратно совместимое поведение байт-в-байт).
     Возвращает (chunk_id, level):
-      level='both'    — первый по порядку чанк, где найдены ВСЕ непустые уникальные сущности;
-      level='partial' — первый чанк, где найдена хотя бы одна (если 'both' нигде нет);
-      (None, None)    — сущности не найдены ни в одном чанке.
+      level='both'    — чанк с полным подтверждением (по максимальному рангу двух ветвей);
+      level='partial' — подтверждение одной сущности/цитаты;
+      (None, None)    — не найдено ни в одном чанке.
+    Ветка A (каноны): first both, иначе first partial — как раньше.
+    Ветка B (цитаты): обе в одном чанке -> 'both' @ этот чанк; иначе первая найденная
+    цитата -> 'partial' @ её чанк (субъект-цитата приоритетнее — subject-first детерминизм).
+    Слияние: уровень = максимальный по рангу (both > partial); при равенстве — якорь
+    ветки B (verbatim — более сильное свидетельство: дословные формы исходного текста).
     Нормализация _norm_entity с обеих сторон (lower + свёрнутые пробелы) — case-insensitive."""
     uniq = {str(e).strip() for e in entities if e and str(e).strip()}
     norms = {n for n in (_norm_entity(e) for e in uniq)}
     norms.discard("")
-    if not norms or not chunk_texts:
-        return None, None
     partial = None
-    for cid, text in chunk_texts:
-        if not text:
-            continue
-        nt = _norm_entity(text)
-        found = {n for n in norms if _entity_in_text(n, nt)}
-        if found == norms:
-            return cid, "both"
-        if found and partial is None:
-            partial = (cid, "partial")
-    return partial if partial else (None, None)
+    if norms and chunk_texts:
+        for cid, text in chunk_texts:
+            if not text:
+                continue
+            nt = _norm_entity(text)
+            found = {n for n in norms if _entity_in_text(n, nt)}
+            if found == norms:
+                a_mccid, a_lvl = cid, "both"
+                break
+            if found and partial is None:
+                partial = (cid, "partial")
+        else:
+            a_mccid, a_lvl = partial if partial else (None, None)
+    else:
+        a_mccid, a_lvl = None, None
+    # Ветка B: цитаты-вербатимы (проверенные при извлечении, но могущие пересекать
+    # границу чанков — тогда их вклад нулевой и отрабатывает ветка A; не ошибка).
+    vs_n = _norm_entity(verbatims[0]) if verbatims and len(verbatims) > 0 else ""
+    vo_n = _norm_entity(verbatims[1]) if verbatims and len(verbatims) > 1 else ""
+    b_mccid, b_lvl = None, None
+    if chunk_texts and (vs_n or vo_n):
+        subj_chunk = obj_chunk = None
+        for cid, text in chunk_texts:
+            if not text:
+                continue
+            nt = _norm_entity(text)
+            vs_hit = bool(vs_n) and _entity_in_text(vs_n, nt)
+            vo_hit = bool(vo_n) and _entity_in_text(vo_n, nt)
+            if vs_hit and vo_hit:  # обе цитаты (значит, обе непустые) в одном чанке
+                b_mccid, b_lvl = cid, "both"
+                break
+            if vs_hit and subj_chunk is None:
+                subj_chunk = cid
+            if vo_hit and obj_chunk is None:
+                obj_chunk = cid
+        if b_lvl is None:
+            # subject-first: чанк цитаты субъекта приоритетнее чанка цитаты объекта
+            if subj_chunk is not None:
+                b_mccid, b_lvl = subj_chunk, "partial"
+            elif obj_chunk is not None:
+                b_mccid, b_lvl = obj_chunk, "partial"
+    # Слияние по максимальному рангу; при равенстве — якорь ветки B (verbatim сильнее)
+    _rank = {"both": 2, "partial": 1}
+    if _rank.get(b_lvl, 0) > _rank.get(a_lvl, 0):
+        return b_mccid, b_lvl
+    if _rank.get(b_lvl, 0) == _rank.get(a_lvl, 0) and b_mccid is not None:
+        return b_mccid, b_lvl
+    return a_mccid, a_lvl
 
 def _make_graph_snippet(text, entities, max_chars=GRAPH_GROUNDING_SNIPPET_MAX):
     """Фрагмент-подтверждение: короткий чанк целиком, иначе окно вокруг первого вхождения
@@ -3837,7 +3944,7 @@ def _graph_autorepair_stale_edges(conn, docs_coll, all_id_set, window_size, max_
     updated_edges = lvl2_files = requeued_chunks = 0
     try:
         rows = conn.execute(
-            "SELECT id, source, relation, target, chunk_id, source_chunk FROM relations").fetchall()
+            "SELECT id, source, relation, target, chunk_id, source_chunk, source_verbatim, target_verbatim FROM relations").fetchall()
         if len(rows) > 100000:
             log_graph.warning("Автолечение: relations слишком велика (%d строк) — проход пропущен", len(rows))
             return 0, 0, 0
@@ -3859,11 +3966,11 @@ def _graph_autorepair_stale_edges(conn, docs_coll, all_id_set, window_size, max_
                 max_i = pairs[-1][0] if pairs else -1
                 max_idx_cache[fp] = (max_i, [p[1] for p in pairs])
             return max_idx_cache[fp]
-        for (rid, s, _rel, t, cid, sc) in rows:
+        for (rid, s, _rel, t, cid, sc, vs, vo) in rows:
             fp, win_ids = _rebuild_window_chunk_ids(cid, window_size)
             if fp is None:
                 continue  # GraphML (chunk_id = имя схемы): не лечится, пропускаем
-            rows_by_fp.setdefault(fp, []).append((rid, s, t))
+            rows_by_fp.setdefault(fp, []).append((rid, s, t, vs, vo))
             # семантика = warning в _ground_graph_rows: невалидный source_chunk ЛИБО
             # (при NULL) отсутствующие id окна, восстановленного из chunk_id.
             # Фикс цикла: при NULL считаем протухом только id В ПРЕДЕЛАХ файла
@@ -3871,7 +3978,7 @@ def _graph_autorepair_stale_edges(conn, docs_coll, all_id_set, window_size, max_
             # (len(win)=6, файл короче) существовать и не должен — это НЕ протухание,
             # иначе последние окна вечно ложатся в принудительный сброс каждого прохода.
             if sc is not None and sc not in all_id_set:
-                stale_by_fp.setdefault(fp, []).append((rid, s, t))
+                stale_by_fp.setdefault(fp, []).append((rid, s, t, vs, vo))
             elif not sc:
                 max_i, _ids = _file_chunks_info(fp)
                 for wi in win_ids:
@@ -3880,7 +3987,7 @@ def _graph_autorepair_stale_edges(conn, docs_coll, all_id_set, window_size, max_
                     except ValueError:
                         continue
                     if widx <= max_i and wi not in all_id_set:
-                        stale_by_fp.setdefault(fp, []).append((rid, s, t))
+                        stale_by_fp.setdefault(fp, []).append((rid, s, t, vs, vo))
                         break
         # v1.1: сканируем ВСЮ таблицу до конца — строки одного файла рассеяны по таблице,
         # ранний break оставлял бы неполные rows_by_fp/stale_by_fp даже для обрабатываемых
@@ -3903,8 +4010,8 @@ def _graph_autorepair_stale_edges(conn, docs_coll, all_id_set, window_size, max_
                 recs = docs_coll.get(ids=cur_ids, include=["documents"])
                 chunk_texts = [(i, d) for i, d in zip(recs.get("ids", []), recs.get("documents", [])) if d]
                 updates, miss = [], False
-                for (rid, s, t) in file_rows:
-                    mcid, lvl = _match_triplet_to_chunk([s, t], chunk_texts)  # БЕЗ LLM
+                for (rid, s, t, vs, vo) in file_rows:
+                    mcid, lvl = _match_triplet_to_chunk([s, t], chunk_texts, [vs, vo])  # БЕЗ LLM
                     if lvl in ("both", "partial"):
                         updates.append((mcid, mcid, rid))
                     else:
@@ -3968,9 +4075,9 @@ def _ground_graph_rows(rows, client, norm_to_orig):
             window_size = 6
         # 1. Разбор: GraphML-рёбра (chunk_id без '_chunk_{N}') отделяются от рёбер паука
         parsed, need_ids = [], set()
-        for (s, rel, t, cid, sc) in rows:
+        for (s, rel, t, cid, sc, vs, vo) in rows:
             fp, win_ids = _rebuild_window_chunk_ids(cid, window_size)
-            parsed.append((s, rel, t, cid, sc, fp, win_ids))
+            parsed.append((s, rel, t, cid, sc, fp, win_ids, vs, vo))
             if fp is None:
                 continue                    # GraphML: текстовых чанков нет
             if sc:
@@ -4000,7 +4107,7 @@ def _ground_graph_rows(rows, client, norm_to_orig):
         def _rank(lvl):
             return {"both": 2, "partial": 1}.get(lvl, 0)
         groups = {}
-        for (s, rel, t, cid, sc, fp, win_ids) in parsed:
+        for (s, rel, t, cid, sc, fp, win_ids, vs, vo) in parsed:
             if fp is None:  # GraphML: chunk_id = имя файла схемы, матчинг не выполняется
                 groups.setdefault((s, rel, t), {})["scheme::" + cid] = \
                     {"display": cid, "level": "scheme", "snippet": "", "chunk_id": None}
@@ -4014,11 +4121,12 @@ def _ground_graph_rows(rows, client, norm_to_orig):
                 entry = g[fp] = {"display": display, "level": "none", "snippet": "", "chunk_id": None}
             mcid, lvl = None, None
             if sc and sc in id2doc:
-                # паук записал якорь: проверяем уровень на самом чанке (дёшево, без LLM)
-                mcid, lvl = _match_triplet_to_chunk([s, t], [(sc, id2doc[sc])])
+                # паук записал якорь: проверяем уровень на самом чанке (дёшево, без LLM);
+                # после пере-чанковки якорный чанк может не содержать цитату — ветка A fallback
+                mcid, lvl = _match_triplet_to_chunk([s, t], [(sc, id2doc[sc])], [vs, vo])
             if not lvl:
                 # метод Б: восстановление окна + общий матччер (старые рёбра, NULL-якорь, протухший якорь)
-                mcid, lvl = _match_triplet_to_chunk([s, t], [(i, id2doc[i]) for i in win_ids if i in id2doc])
+                mcid, lvl = _match_triplet_to_chunk([s, t], [(i, id2doc[i]) for i in win_ids if i in id2doc], [vs, vo])
             if lvl and _rank(lvl) > _rank(entry["level"]):
                 entry.update(level=lvl, chunk_id=mcid,
                              snippet=id2doc.get(mcid, "") if mcid else "")
@@ -4053,8 +4161,8 @@ def _ground_graph_rows(rows, client, norm_to_orig):
                     budget -= 1
                     shown_snippets.add(entry["chunk_id"])
                     mark = "" if entry["level"] == "both" else \
-                        " (частичное подтверждение: в чанке окна дословно найдена только одна сущность)"
-                    lines.append(f"  [Из файла: {entry['display']}]{mark} Фрагмент: «{_make_graph_snippet(entry['snippet'], [s, t])}»")
+                        " (частичное подтверждение: дословно найдена только одна сущность)"
+                    lines.append(f"  [Из файла: {entry['display']}]{mark} Фрагмент: «{_make_graph_snippet(entry['snippet'], [s, t, vs, vo])}»")
         log_graph.debug("GraphRAG grounding: триплетов=%d, подтверждение: both=%d, partial=%d, none=%d, scheme=%d",
                         stat["both"] + stat["partial"] + stat["none"] + stat["scheme"],
                         stat["both"], stat["partial"], stat["none"], stat["scheme"])
@@ -4063,7 +4171,7 @@ def _ground_graph_rows(rows, client, norm_to_orig):
         # Fallback на старый формат без привязки — инструмент не роняем никогда
         log_graph.error("GraphRAG grounding: сбой (%s): %s — выданы голые триплеты", _classify_net_error(e), e)
         seen, out = set(), []
-        for (s, rel, t, _cid, _sc) in rows:
+        for (s, rel, t, _cid, _sc, _vs, _vo) in rows:
             if (s, rel, t) not in seen:
                 seen.add((s, rel, t))
                 out.append(f"{norm_to_orig.get(s, s)} -> [{rel}] -> {norm_to_orig.get(t, t)}")
@@ -4095,8 +4203,9 @@ def query_knowledge_graph(query):
         conn = sqlite3.connect(get_graph_db_path(), timeout=30)
         ph = ",".join("?" * len(norms))
         rows = conn.execute(
-            f"SELECT DISTINCT source, relation, target, chunk_id, source_chunk FROM relations "
+            f"SELECT source, relation, target, chunk_id, source_chunk, source_verbatim, target_verbatim FROM relations "
             f"WHERE lower(source) IN ({ph}) OR lower(target) IN ({ph}) "
+            f"GROUP BY source, relation, target, chunk_id, source_chunk "
             f"ORDER BY source, relation, target LIMIT {GRAPH_GROUNDING_MAX_SQL_ROWS}",
             (*norms, *norms)).fetchall()
         conn.close()
@@ -5238,13 +5347,17 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.0.0 Enterprise"
+APP_VERSION = "v2.1.0 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
     "1.6.0 - Появилась возможность читать аудио файлы и транскрибировать их.\n"
     "1.7.0 - Появилась возможность подключения к xwiki и добавления знаний в базу\n"
     "2.0.0 - Добавление графового поиска. Теперь агент имеет гибридный поиск. + мелкие правки безопасности и исправление багов.\n"
+    "2.1.0 - Verbatim-якорение граф-рёбер (канон + дословные цитаты с проверкой по окну): "
+    "NULL-якоря у пере-извлечённых файлов сократились с 94–100% до 0–45%. "
+    "Ручной скрипт пере-извлечения ударных файлов (scripts/reextract_null_edges.py). "
+    "crash.log теперь дописывается, а не очищается.\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
     "Приложение помогает анализировать документы, выполнять аудит,\n"
     "искать информацию по базе знаний и формировать рабочие материалы.\n"
@@ -5836,7 +5949,9 @@ class App(ctk.CTk):
                     # отмечаются обработанными — иначе бесконечный цикл с повторным LLM-извлечением.
                     try:
                         canonical = {}
-                        for subj, pred, obj in rels:
+                        # rels теперь всегда 5-полевые (verbatim-формат парсера D-2026-09-25-03);
+                        # петли канонизации и записи рёбер обязаны распаковывать 5 полей
+                        for subj, pred, obj, _vs, _vo in rels:
                             for name in (subj, obj):
                                 if not name: continue
                                 n = _norm_entity(name)
@@ -5873,13 +5988,14 @@ class App(ctk.CTk):
                         window_chunks = [(cid, id2doc[cid]) for cid in sorted(win, key=_idx_of)
                                          if cid in id2doc and id2doc[cid]]
                         m_exact = m_partial = m_miss = 0
-                        for subj, pred, obj in rels:
+                        m_verbatim = 0  # рёбра с обеими непустыми (проверенными) цитатами — метрика качества промпта
+                        for subj, pred, obj, vs, vo in rels:
                             s = _norm_entity(subj)
                             t = _norm_entity(obj)
                             if s and t:
                                 src_chunk = None
                                 try:
-                                    mcid, lvl = _match_triplet_to_chunk([subj, obj], window_chunks)
+                                    mcid, lvl = _match_triplet_to_chunk([subj, obj], window_chunks, [vs, vo])
                                     if lvl == "both":
                                         src_chunk = mcid; m_exact += 1
                                     elif lvl == "partial":
@@ -5890,11 +6006,13 @@ class App(ctk.CTk):
                                     m_miss += 1
                                     log_graph.warning("Матчинг триплета окна %s не удался (%s): «%s» -[%s]-> «%s» — ребро без source_chunk",
                                                       center_id, _classify_net_error(m_err), subj, pred, obj)
-                                conn.execute("INSERT INTO relations(source, relation, target, chunk_id, source_chunk) VALUES (?,?,?,?,?)",
-                                             (s, pred, t, center_id, src_chunk))
+                                if vs and vo:
+                                    m_verbatim += 1
+                                conn.execute("INSERT INTO relations(source, relation, target, chunk_id, source_chunk, source_verbatim, target_verbatim) VALUES (?,?,?,?,?,?,?)",
+                                             (s, pred, t, center_id, src_chunk, (vs or None), (vo or None)))
                         if rels:
-                            log_graph.info("Окно %s: матчинг рёбер: точных=%d, частичных=%d, промахов=%d",
-                                           center_id, m_exact, m_partial, m_miss)
+                            log_graph.info("Окно %s: матчинг рёбер: точных=%d, частичных=%d, промахов=%d, с вербатим-цитатами=%d",
+                                           center_id, m_exact, m_partial, m_miss, m_verbatim)
                     except Exception as write_err:
                         msg = str(write_err).lower()
                         if "dimension" in msg or "shape" in msg or "embedding" in msg:
@@ -10343,5 +10461,12 @@ class App(ctk.CTk):
                 pass
 
 if __name__ == '__main__':
+    # Нативные краши (access violation в C-расширениях, например chromadb_rust_bindings)
+    # не оставляют Python-трейсбека: faulthandler пишет стек всех потоков в crash.log профиля.
+    import faulthandler
+    try:
+        faulthandler.enable(open(os.path.join(get_local_path(), "crash.log"), "a", encoding="utf-8"))
+    except Exception:
+        pass
     app = App()
     app.mainloop()
