@@ -30,3 +30,9 @@ plans/
 .roo/
 .roomodes
 .kilo/
+
+# Soak/ремонтные артефакты (копии баз, логи и диагностика — создаются скриптами, в репо не нужны)
+backup_smk_vector_db_*/
+soak_copy_*/
+.tmp_diag_prod_graph/
+soak_crash.log
