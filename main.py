@@ -982,7 +982,8 @@ def _extract_xlsx_comments(path):
             except Exception:
                 pass
 
-            # Карта файлов комментариев -> имя видимого листа (через rels листов)
+            # Карта файлов комментариев -> (имя листа, видимость) через rels листов;
+            # при разделе одного файла несколькими листами приоритет у видимого
             comments_sheet_by_file = {}
             for n in names:
                 m = re.fullmatch(r"xl/worksheets/_rels/sheet(\d+)\.xml\.rels", n)
@@ -991,11 +992,12 @@ def _extract_xlsx_comments(path):
                 try:
                     for rel in ET.fromstring(zf.read(n)):
                         tgt_base = os.path.basename(rel.get("Target") or "")
-                        if (re.fullmatch(r"(?:comments?\d+|threadedComment\d+)\.xml", tgt_base)
-                                and tgt_base not in comments_sheet_by_file):
+                        if re.fullmatch(r"(?:comments?\d+|threadedComment\d+)\.xml", tgt_base):
                             info = sheet_info_by_target.get(f"sheet{m.group(1)}.xml")
-                            if info and info[1]:
-                                comments_sheet_by_file[tgt_base] = info[0]
+                            if info:
+                                prev = comments_sheet_by_file.get(tgt_base)
+                                if prev is None or (not prev[1] and info[1]):
+                                    comments_sheet_by_file[tgt_base] = info
                 except Exception:
                     continue
 
@@ -1019,7 +1021,10 @@ def _extract_xlsx_comments(path):
 
             # Сначала threaded (основной источник), затем legacy — дедупликация по ячейке
             for tf in threaded_files:
-                sheet_name = comments_sheet_by_file.get(os.path.basename(tf), "")
+                resolved = comments_sheet_by_file.get(os.path.basename(tf))
+                if resolved and not resolved[1]:
+                    continue
+                sheet_name = resolved[0] if resolved else ""
                 try:
                     for tc in ET.fromstring(zf.read(tf)).findall(f"{{{main_ns}}}threadedComment"):
                         ref = (tc.get("ref") or "").strip()
@@ -1045,7 +1050,10 @@ def _extract_xlsx_comments(path):
                     print(f"Ошибка разбора {os.path.basename(tf)} в {os.path.basename(path)}: {ce}")
 
             for cf in legacy_files:
-                sheet_name = comments_sheet_by_file.get(os.path.basename(cf), "")
+                resolved = comments_sheet_by_file.get(os.path.basename(cf))
+                if resolved and not resolved[1]:
+                    continue
+                sheet_name = resolved[0] if resolved else ""
                 try:
                     c_root = ET.fromstring(zf.read(cf))
                     authors_el = c_root.find(f"{{{main_ns}}}authors")
@@ -2069,6 +2077,8 @@ def extract_text_from_excel_for_rag(filepath):
         all_text_lines = []
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
+            if ws.sheet_state != "visible":
+                continue
 
             # 1. Читаем значения объединенных ячеек в словарь для быстрого доступа
             merged_map = {}
@@ -3806,6 +3816,8 @@ GRAPH_GROUNDING_MAX_ROWS = 80          # максимум триплетов в 
 GRAPH_GROUNDING_MAX_FILES_PER_TRIPLE = 4  # максимум файлов-источников на триплет в выдаче
 GRAPH_GROUNDING_SNIPPET_MAX = 600      # символов во фрагменте-подтверждении (чанк ~350 симв.)
 GRAPH_GROUNDING_MAX_SNIPPETS = 10      # максимум уникальных фрагментов (both+partial, после дедупа по чанку)
+GRAPH_GROUNDING_LINK_TOPK = 8          # векторный топ лейблов при линковке сущностей (коридор 5-10, середина)
+GRAPH_GROUNDING_LINK_MAX_NODES = 16    # кап уникальных норм-ключей линковки (защита SQL-фильтра от взрыва на частотных словах)
 
 _GRAPH_WORD_CHAR = re.compile(r"[0-9a-zA-Zа-яА-ЯёЁ]")  # буква/цифра — для границ слова
 
@@ -4061,13 +4073,58 @@ def _graph_autorepair_stale_edges(conn, docs_coll, all_id_set, window_size, max_
         log_graph.error("Автолечение рёбер: общая ошибка (%s): %s", _classify_net_error(e), e)
     return updated_edges, lvl2_files, requeued_chunks
 
+def _link_graph_entities(coll, conn, query):
+    """Широкая линковка сущностей запроса к узлам графа (D-2026-09-24-03): векторный топ
+    GRAPH_GROUNDING_LINK_TOPK (было 3) + дешёвая substring-ветка по лейблам кэша node_embeddings
+    (два направления word-boundary матчинга через _entity_in_text: лейбл дословно в запросе
+    и запрос целиком внутри лейбла — ловит хвостовые уточнения).
+    Возвращает (norms, norm_to_orig). Только чтение (init_graph_db не вызывает); никогда не
+    бросает: сбой substring-ветки -> только векторные нормы (сегодняшнее поведение).
+    Кап GRAPH_GROUNDING_LINK_MAX_NODES: векторные первыми, substring-хиты хвостом."""
+    norms, norm_to_orig = [], {}
+    try:
+        res = coll.query(query_texts=[query], n_results=GRAPH_GROUNDING_LINK_TOPK)
+        names = res.get("documents", [[]])[0]
+        norms = list(dict.fromkeys(n for n in (_norm_entity(x) for x in names) if n))
+        for n in names:
+            k = _norm_entity(n)
+            if k:
+                norm_to_orig.setdefault(k, n)
+    except Exception as e:
+        log_graph.warning("GraphRAG линковка: сбой векторной ветки (%s): %s", _classify_net_error(e), e)
+        norms, norm_to_orig = [], {}
+    n_vec = len(norms)
+    n_sub = 0
+    try:
+        nq = _norm_entity(query)
+        if nq:
+            for (canonical,) in conn.execute("SELECT canonical FROM node_embeddings").fetchall():
+                n = _norm_entity(canonical)
+                if not n or n in norm_to_orig:
+                    continue
+                if _entity_in_text(n, nq) or _entity_in_text(nq, n):
+                    norm_to_orig.setdefault(n, canonical)
+                    norms.append(n)
+        n_sub = len(norms) - n_vec
+    except Exception as e:
+        n_sub = len(norms) - n_vec
+        log_graph.warning("GraphRAG линковка: сбой substring-ветки (%s): %s — использованы только векторные нормы",
+                          _classify_net_error(e), e)
+    if len(norms) > GRAPH_GROUNDING_LINK_MAX_NODES:  # детерминированный кап
+        norms = norms[:GRAPH_GROUNDING_LINK_MAX_NODES]
+    log_graph.info("GraphRAG: линковка: вектор=%d, substring=%d, всего=%d", n_vec, n_sub, len(norms))
+    return norms, norm_to_orig
+
 def _ground_graph_rows(rows, client, norm_to_orig):
     """Точечный grounding: группировка рёбер по триплетам и файлам (ключ = file_path, НЕ отображаемое
     имя: разные файлы могут иметь одинаковый basename), якорный чанк из source_chunk (уровень
     пересчитывается на одном чанке) или восстановление окна (метод Б) для старых рёбер. Резка выдачи:
     SQL-строки -> триплеты (MAX_ROWS) -> файлы на триплет (MAX_FILES_PER_TRIPLE); фрагменты
     дедуплицируются по chunk_id. Никогда не бросает исключений. Уровни: both — обе сущности дословно;
-    partial — одна (фрагмент с пометкой «частичное подтверждение»); none — голый триплет; scheme — GraphML."""
+    partial — одна (фрагмент с пометкой «частичное подтверждение»); none — голый триплет; scheme — GraphML.
+    Ранжирование перед резкой (D-2026-09-24-03): группы сортируются по лучшему уровню подтверждения
+    (both > partial > none; scheme = 0) ДО резки MAX_ROWS; файлы внутри триплета — тоже по уровню.
+    Стабильная сортировка: при равном ранге сохраняется прежний (алфавитный SQL) порядок."""
     try:
         try:
             window_size = int(load_global_settings().get("graph_rag_window", 6))
@@ -4130,12 +4187,18 @@ def _ground_graph_rows(rows, client, norm_to_orig):
             if lvl and _rank(lvl) > _rank(entry["level"]):
                 entry.update(level=lvl, chunk_id=mcid,
                              snippet=id2doc.get(mcid, "") if mcid else "")
-        # 4. Форматирование трёхуровневой выдачи (резка: триплеты -> файлы -> фрагменты с дедупом по чанку)
+        # 4. Ранжирование перед резкой (D-2026-09-24-03): группы по лучшему уровню подтверждения
+        # (both > partial > none; scheme = 0); stable sort — при равном ранге прежний SQL-порядок
+        ordered_groups = sorted(groups.items(),
+                                key=lambda kv: max((_rank(e["level"]) for e in kv[1].values()), default=0),
+                                reverse=True)
+        # 5. Форматирование трёхуровневой выдачи (резка: триплеты -> файлы -> фрагменты с дедупом по чанку)
         lines, budget = [], GRAPH_GROUNDING_MAX_SNIPPETS
         shown_snippets = set()   # chunk_id уже показанных фрагментов (одно окно -> много триплетов)
         stat = {"both": 0, "partial": 0, "none": 0, "scheme": 0}
         n_triplets = 0
-        for (s, rel, t), files in groups.items():
+        total_groups = len(groups)
+        for (s, rel, t), files in ordered_groups:
             if n_triplets >= GRAPH_GROUNDING_MAX_ROWS:  # резка по триплетам, не по строкам
                 break
             n_triplets += 1
@@ -4143,7 +4206,9 @@ def _ground_graph_rows(rows, client, norm_to_orig):
             best = max((_rank(e["level"]) for e in files.values()), default=0)
             stat["both" if best == 2 else "partial" if best == 1 else
                   "scheme" if any(e["level"] == "scheme" for e in files.values()) else "none"] += 1
-            for shown, (fkey, entry) in enumerate(files.items()):
+            # файлы триплета — по уровню подтверждения (stable: равные — прежний порядок вставки)
+            file_items = sorted(files.items(), key=lambda kv: -_rank(kv[1]["level"]))
+            for shown, (fkey, entry) in enumerate(file_items):
                 if shown >= GRAPH_GROUNDING_MAX_FILES_PER_TRIPLE:
                     lines.append(f"  …и ещё {len(files) - shown} файл(ов)-источник(ов)")
                     break
@@ -4163,9 +4228,10 @@ def _ground_graph_rows(rows, client, norm_to_orig):
                     mark = "" if entry["level"] == "both" else \
                         " (частичное подтверждение: дословно найдена только одна сущность)"
                     lines.append(f"  [Из файла: {entry['display']}]{mark} Фрагмент: «{_make_graph_snippet(entry['snippet'], [s, t, vs, vo])}»")
-        log_graph.debug("GraphRAG grounding: триплетов=%d, подтверждение: both=%d, partial=%d, none=%d, scheme=%d",
-                        stat["both"] + stat["partial"] + stat["none"] + stat["scheme"],
-                        stat["both"], stat["partial"], stat["none"], stat["scheme"])
+        log_graph.info("GraphRAG grounding: показано триплетов=%d/%d (both=%d, partial=%d, none=%d, scheme=%d), сниппетов=%d/%d",
+                       n_triplets, total_groups,
+                       stat["both"], stat["partial"], stat["none"], stat["scheme"],
+                       GRAPH_GROUNDING_MAX_SNIPPETS - budget, GRAPH_GROUNDING_MAX_SNIPPETS)
         return "\n".join(lines)
     except Exception as e:
         # Fallback на старый формат без привязки — инструмент не роняем никогда
@@ -4178,29 +4244,23 @@ def _ground_graph_rows(rows, client, norm_to_orig):
         return "\n".join(out) if out else "В графе связей не найдено."
 
 def query_knowledge_graph(query):
-    """Инструмент агента: векторный поиск узлов + связи из sqlite. Формат 'Узел -> [связь] -> Узел'.
+    """Инструмент агента: линковка сущностей запроса + связи из sqlite. Формат 'Узел -> [связь] -> Узел'.
+    Линковка широкая (D-2026-09-24-03): векторный топ GRAPH_GROUNDING_LINK_TOPK + точный substring
+    по лейблам кэша node_embeddings (оба направления _entity_in_text), кап LINK_MAX_NODES.
     Рёбра хранят нормализованный ключ (_norm_entity), узел document — оригинал; lower() в SQL даёт
     backward-compat со старыми рёбрами (оригиналы другого регистра) и новыми нормализованными.
     Каждый триплет выдаётся с файлами-источниками и дословным фрагментом-подтверждением
-    (лестница: обе сущности -> одна (пометка «частичное подтверждение») -> голый триплет)."""
+    (лестница: обе сущности -> одна (пометка «частичное подтверждение») -> голый триплет);
+    группы ранжируются по уровню подтверждения (both > partial > none) перед резкой лимитами."""
     try:
         init_graph_db()
         client = chromadb.PersistentClient(path=get_db_path())
         coll = client.get_or_create_collection(name="smk_graph_nodes", embedding_function=get_cloud_ef())
-        res = coll.query(query_texts=[query], n_results=3)
-        names = res.get("documents", [[]])[0]
-        if not names:
-            return "В графе связей не найдено."
-        norms = [n for n in (_norm_entity(x) for x in names) if n]
-        if not norms:
-            return "В графе связей не найдено."
-        norms = list(dict.fromkeys(norms))  # уникальные с сохранением порядка
-        norm_to_orig = {}
-        for n in names:
-            k = _norm_entity(n)
-            if k:
-                norm_to_orig.setdefault(k, n)
         conn = sqlite3.connect(get_graph_db_path(), timeout=30)
+        norms, norm_to_orig = _link_graph_entities(coll, conn, query)
+        if not norms:
+            conn.close()
+            return "В графе связей не найдено."
         ph = ",".join("?" * len(norms))
         rows = conn.execute(
             f"SELECT source, relation, target, chunk_id, source_chunk, source_verbatim, target_verbatim FROM relations "
@@ -4209,6 +4269,9 @@ def query_knowledge_graph(query):
             f"ORDER BY source, relation, target LIMIT {GRAPH_GROUNDING_MAX_SQL_ROWS}",
             (*norms, *norms)).fetchall()
         conn.close()
+        log_graph.info("GraphRAG: SQL-строк=%d", len(rows))
+        if len(rows) >= GRAPH_GROUNDING_MAX_SQL_ROWS:
+            log_graph.warning("GraphRAG: SQL-кап достигнут (%d строк), рёбра могли не дойти до ранжирования", len(rows))
         if not rows:
             return "В графе связей не найдено."
         # Точечный grounding: файл-источник + дословный фрагмент (метод Б для старых рёбер)
@@ -5347,17 +5410,19 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.1.1 Enterprise"
+APP_VERSION = "v2.1.3 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
+    "2.1.3 - Ранжирование графового поиска: триплеты сортируются по уровню подтверждения "
+    "(both > partial > none) перед резкой лимитами, файлы внутри триплета — тоже; усиленная "
+    "линковка сущностей (векторный топ-8 + substring-матч по лейблам графа); расширенная "
+    "статистика в логах.\n"
+    "2.1.2 - Единообразие скрытых листов Excel: скрытые листы (hidden/veryHidden) больше не "
+    "попадают в RAG-индексацию и в комментарии вложений чата; точный пере-синк затронутых "
+    "Excel-файлов одноразовым скриптом (scripts/reset_excel_file_states.py).\n"
     "2.1.1 - Обновление библиотеки векторного поиска (chromadb 1.5.5 → 1.5.9) против известных "
-    "нативных крашей rust-биндингов; пересборка exe. Soak-тест на копии прод-базы пройден.\n"
-    "2.1.0 - Verbatim-якорение граф-рёбер (канон + дословные цитаты с проверкой по окну): "
-    "NULL-якоря у пере-извлечённых файлов сократились с 94–100% до 0–45%. "
-    "Ручной скрипт пере-извлечения ударных файлов (scripts/reextract_null_edges.py). "
-    "crash.log теперь дописывается, а не очищается.\n"
-    "2.0.0 - Добавление графового поиска. Теперь агент имеет гибридный поиск. + мелкие правки безопасности и исправление багов.\n"
+    "нативных крашей rust-биндингов; пересборка exe. Soак-тест на копии прод-базы пройден.\n"
     "Полная история изменений: docs/DECISIONS.md.\n"
     "\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
