@@ -541,17 +541,20 @@ def get_llm_client():
 
 class VisionAPIError(Exception):
     """Сбой распознавания Vision API. kind — классификация из _classify_net_error
-    либо NO_KEY / CIRCUIT_OPEN. failed_pages — номера нераспознанных страниц PDF,
-    partial_text — успешно распознанная часть (для контекста чата)."""
-    def __init__(self, message, kind="UNKNOWN", failed_pages=None, partial_text=None):
+    либо NO_KEY / CIRCUIT_OPEN. failed_pages — номера нераспознанных страниц PDF
+    (частично распознанное уже лежит в кэше и будет до-распознано при повторе)."""
+    def __init__(self, message, kind="UNKNOWN", failed_pages=None):
         super().__init__(message)
         self.kind = kind
         self.failed_pages = failed_pages or []
-        self.partial_text = partial_text
 
 
 # Состояние цепи сбоев Vision OCR (глобальное; живёт в рамках одной синхронизации)
 _VISION_CIRCUIT = {"streak": 0, "kind": None, "open": False}
+
+# Таймаут одного Vision-вызова в секундах (D-2026-09-24-01): без него SDK ждёт до
+# 600 с × ретрай → «зависший» синк. Транзиентный TIMEOUT ловится и ретраится один раз.
+_VISION_CALL_TIMEOUT = 120
 
 
 def _vision_circuit_reset():
@@ -1096,11 +1099,24 @@ def _get_or_convert_xls(file_path):
 
     Кэш-ключ содержит md5 полного пути (коллизии одинаковых имён из разных папок);
     свежий кэш (mtime кэша >= mtime оригинала) переиспользуется без запуска Excel.
-    Возвращает путь к кэш-конверсии или None при сбое (Excel не установлен, пароль, битый файл).
-    COM-инициализация самодостаточна (парный CoInitialize/CoUninitialize) — вложенность
-    в поток load_files_bg легальна (прецедент safe_read_old_word_file).
+    Возвращает путь к кэш-конверсии или None при сбое (Excel не установлен, пароль,
+    битый/не-OLE2 файл). COM-инициализация самодостаточна (парный CoInitialize/
+    CoUninitialize) — вложенность в поток load_files_bg легальна (прецедент
+    safe_read_old_word_file).
     """
     try:
+        # Не-OLE2 файл под видом .xls: Excel COM умеет «восстанавливать» произвольные
+        # бинарники в лист с мусором. Настоящий .xls (BIFF) всегда лежит в OLE2-контейнере —
+        # проверяем сигнатуру ДО COM, иначе мусор проиндексируется вместо честного «Ошибка…»
+        try:
+            with open(file_path, "rb") as f:
+                if f.read(8) != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+                    print(f"Файл {os.path.basename(file_path)} не является настоящим .xls (нет OLE2-сигнатуры) — конверсия отменена")
+                    return None
+        except OSError as sig_err:
+            print(f"Не удалось прочитать голову {os.path.basename(file_path)} для проверки .xls: {sig_err}")
+            return None
+
         cache_dir = os.path.join(get_base_path(), ".cache", "converted_xls")
         abs_path = os.path.abspath(file_path)
         cache_key = hashlib.md5(abs_path.encode("utf-8", "ignore")).hexdigest()[:8]
@@ -1259,7 +1275,7 @@ def extract_smart_vision_and_pdf(filepath):
             ]
 
             def _create_request():
-                return get_llm_client().chat.completions.create(model=vision_model, messages=messages)
+                return get_llm_client().chat.completions.create(model=vision_model, messages=messages, timeout=_VISION_CALL_TIMEOUT)
 
             try:
                 response = _create_request()
@@ -1349,6 +1365,7 @@ def extract_smart_vision_and_pdf(filepath):
                             failed_pages.append(page_num + 1)
                             pdf_fail_kind = pdf_fail_kind or "CIRCUIT_OPEN"
                             continue
+                        log_core.info("Vision OCR %s: страница %d/%d — отправка в Vision", os.path.basename(filepath), page_num + 1, len(doc))
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                         b64_str = base64.b64encode(pix.tobytes("png")).decode("utf-8")
                         try:
@@ -1361,6 +1378,14 @@ def extract_smart_vision_and_pdf(filepath):
                             continue
                         _vision_circuit_reset()
                         page_blocks[page_num] = f"--- Страница {page_num + 1} (Vision OCR) ---\n{vision_text}\n"
+                        # Постраничный прогресс: перезаписываем кэш всеми готовыми Vision-страницами,
+                        # чтобы «убитый» процесс не терял оплаченный OCR (D-2026-09-24-01)
+                        try:
+                            with open(cache_path, "w", encoding="utf-8") as f:
+                                f.write("\n".join(page_blocks[i] for i in sorted(page_blocks)))
+                        except Exception as e:
+                            log_core.warning("Vision OCR %s: не удалось записать постраничный кэш: %s", os.path.basename(filepath), e)
+                        log_core.info("Vision OCR %s: страница %d/%d — ок (%d симв.)", os.path.basename(filepath), page_num + 1, len(doc), len(vision_text))
                     else:
                         # Native-страницы «бесплатные»: всегда извлекаются заново локально
                         page_blocks[page_num] = f"--- Страница {page_num + 1} (Native Text) ---\n{native_text}\n"
@@ -1371,15 +1396,13 @@ def extract_smart_vision_and_pdf(filepath):
                 # Прогресс сохраняется: кэш перезаписывается ТОЛЬКО успешными страницами.
                 # Текст ошибки Vision в кэш не пишется никогда.
                 ok_blocks = [page_blocks[i] for i in sorted(page_blocks)]
-                partial_text = "\n".join(ok_blocks) if ok_blocks else None
                 if ok_blocks:
                     with open(cache_path, "w", encoding="utf-8") as f:
-                        f.write(partial_text)
+                        f.write("\n".join(ok_blocks))
                 raise VisionAPIError(
                     f"Vision OCR не завершён: страницы {failed_pages} не распознаны",
                     kind=pdf_fail_kind or "UNKNOWN",
                     failed_pages=failed_pages,
-                    partial_text=partial_text,
                 )
             # Все страницы готовы: собираем по порядку и идём в общий путь записи кэша
             final_text_blocks = [page_blocks[i] for i in sorted(page_blocks)]
@@ -1619,8 +1642,9 @@ def sync_xwiki(app_instance=None):
                     states = json.load(f)
             except:
                 states = {}
-
-        # Новый цикл синхронизации: цепь сбоев Vision начинает с чистого состояния
+        # Снапшот объёма states ДО цикла: GC-guard (v2.1.4) сравнивает обработанные страницы
+        # с этим снапшотом, а не с живым len(states) (словарь растёт новыми страницами)
+        states_count_before = len(states)
         _vision_circuit_reset()
         # Карта имен inline-иллюстраций, собирается за синк и сохраняется в finally (D-2026-09-20-04)
         image_name_map = {}
@@ -1784,6 +1808,7 @@ def sync_xwiki(app_instance=None):
         processed_count = 0
         active_urls = set() # Журнал всех актуальных и проверенных ссылок
         active_images = set() # Журнал всех актуальных картинок (attachments)
+        hit_login_guard = False # Флаг: в середине синка получена страница входа (вместо контента)
         vision_circuit_ui_notified = False # Сообщение о недоступности Vision OCR в UI — однократно за синк
 
         while queue_urls:
@@ -1826,6 +1851,7 @@ def sync_xwiki(app_instance=None):
                         or "Необходима авторизация" in _cb_text:
                     log_xwiki.error("XWiki: получена страница входа вместо содержимого %s — "
                                     "аутентификация не прошла, проверьте логин/пароль в настройках", current_url)
+                    hit_login_guard = True
                     continue
 
                 # Web Spider: ищем ссылки внутри контента
@@ -1863,6 +1889,14 @@ def sync_xwiki(app_instance=None):
                             if not ext or len(ext) > 5: ext = '.jpg'
                             img_name = hashlib.md5(src.encode('utf-8')).hexdigest() + ext
                             active_images.add(img_name)
+                            # Карта имён в fast-path тоже: иначе установившийся режим подрывал
+                            # карту из D-2026-09-20-04 (мёрдж идемпотентен на выходе синка)
+                            try:
+                                _orig = unquote(os.path.basename(urlparse(src).path))
+                                if _orig:
+                                    image_name_map[img_name] = _orig
+                            except Exception:
+                                pass
                             # Прошлый сбой Vision: кэша нет -> доOCR-им в полном цикле (картинка уже скачана)
                             if ext in ('.png', '.jpg', '.jpeg') and not os.path.exists(_vision_cache_path(os.path.join(attachments_dir, img_name))):
                                 all_vision_cached = False
@@ -1883,12 +1917,21 @@ def sync_xwiki(app_instance=None):
                                 att_file_path = os.path.join(attachments_dir, f"{f_hash}_{orig_fname}")
                                 if not os.path.exists(att_file_path):
                                     all_vision_cached = False
-                                elif _is_login_page_content(open(att_file_path, 'rb').read(8192), orig_fname):
-                                    # Файл есть, но это HTML-страница входа (сбой прошлого скачивания) —
-                                    # проваливаем страницу в полный цикл: process_xwiki_attachments удалит
-                                    # мусор и перекачает вложение (D-2026-09-20-03)
-                                    log_xwiki.warning("XWiki: fast-path: вложение %s — HTML-страница входа вместо файла, требуется перекачка", f"{f_hash}_{orig_fname}")
-                                    all_vision_cached = False
+                                else:
+                                    # Голова файла читаем под guard: залоченный Word/AV кидает OSError —
+                                    # проваливаем страницу в полный цикл (v2.1.4, #13 ревью), не кроша её в общий except
+                                    try:
+                                        _att_head = open(att_file_path, 'rb').read(8192)
+                                    except OSError as _att_err:
+                                        log_xwiki.warning("XWiki: fast-path: вложение %s нечитаемо (%s) — проваливаемся в полный цикл", f"{f_hash}_{orig_fname}", _att_err)
+                                        all_vision_cached = False
+                                    else:
+                                        if _is_login_page_content(_att_head, orig_fname):
+                                            # Файл есть, но это HTML-страница входа (сбой прошлого скачивания) —
+                                            # проваливаем страницу в полный цикл: process_xwiki_attachments удалит
+                                            # мусор и перекачает вложение (D-2026-09-20-03)
+                                            log_xwiki.warning("XWiki: fast-path: вложение %s — HTML-страница входа вместо файла, требуется перекачка", f"{f_hash}_{orig_fname}")
+                                            all_vision_cached = False
                     # -----------------------------------------------------------------
                     
                     if all_vision_cached:
@@ -2016,14 +2059,18 @@ def sync_xwiki(app_instance=None):
                 # Сохраняем стейт даже при ошибке одного документа
                 continue
 
-        # --- СБОРЩИК МУСОРА (Garbage Collector) ---
-        # Защита от массового уничтожения локального корпуса: если активный журнал пуст,
-        # а states — нет, значит синк не обработал ни одной страницы (сбой аутентификации
-        # или сети) и очистка стёрла бы весь кэш. Пропускаем GC — файлы и states не трогаем.
-        if not active_urls and states:
-            log_xwiki.error("XWiki: ни одна страница не обработана, но в states %d URL — "
-                            "сборщик мусора пропущен, локальный кэш сохранён "
-                            "(проверьте аутентификацию/сеть)", len(states))
+        # --- СБОРЩИК МУСОРA (Garbage Collector) ---
+        # Пропорциональный guard (v2.1.4, #1 CRITICAL ревью 2026-09-20): прежний проверял только
+        # «не обработано НИ-ЧЕГО» — при обрыве сети/аутентификации СЕРЕДИНЫ синка обработанные
+        # страницы уже в active_urls, пропущенные — нет, и GC стирал их кэш и states.
+        # Теперь GC работает, только если обработано ≥50% известных ДО синка страниц и не было
+        # login-маскарада; иначе кэш и states сохраняются целиком.
+        if states and (hit_login_guard or len(active_urls) < states_count_before * 0.5):
+            log_xwiki.error(
+                "XWiki: обработано только %d из %d известных страниц%s — сборщик мусора ПРОПУЩЕН, "
+                "локальный кэш и states сохранены (проверьте сеть/аутентификацию)",
+                len(active_urls), states_count_before,
+                "; в середине синка получена страница входа" if hit_login_guard else "")
         else:
             # 1. Удаляем физические файлы (.md), которых больше нет в активном журнале
             valid_md5_names = {hashlib.md5(url.encode('utf-8')).hexdigest() + ".md" for url in active_urls}
@@ -2759,6 +2806,8 @@ def find_target_file(filename, allow_fuzzy=False):
             if os.path.isdir(fuzzy_attach_dir):
                 for f in os.listdir(fuzzy_attach_dir):
                     if os.path.isfile(os.path.join(fuzzy_attach_dir, f)):
+                        if "~$" in f:
+                            continue
                         candidates.append((_strip_attach_hash_prefix(f), os.path.join(fuzzy_attach_dir, f)))
             # Inline-иллюстрации лежат под md5-именем URL — карта возвращает им оригинальные имена
             for _img_hash, _img_orig in _load_image_name_map().items():
@@ -2790,6 +2839,8 @@ def find_target_file(filename, allow_fuzzy=False):
                     if has_excluded(f):
                         continue
                     if allow_fuzzy:
+                        if "~$" in f:
+                            continue
                         candidates.append((f, os.path.join(root, f)))
                     if _norm_filename(f) == target_name:
                         return os.path.join(root, f)
@@ -2798,8 +2849,15 @@ def find_target_file(filename, allow_fuzzy=False):
             return None
 
         # --- Нечеткий фолбэк по имени (D-2026-09-20-02): только однозначные совпадения ---
-        candidates = [(n, p) for i, (n, p) in enumerate(candidates)
-                      if _norm_filename_relaxed(n) not in {_norm_filename_relaxed(m) for m, _ in candidates[:i]}]
+        # Однопроходный дедуп: первый кандидат с relaxed-ключом выигрывает (#8, O(N) вместо O(N²))
+        deduped = []
+        seen_relaxed = set()
+        for n, p in candidates:
+            key = _norm_filename_relaxed(n)
+            if key not in seen_relaxed:
+                seen_relaxed.add(key)
+                deduped.append((n, p))
+        candidates = deduped
         query_str = str(filename).strip()
         if not query_str:
             return None
@@ -2892,7 +2950,18 @@ def _read_file_content_by_path(target_file, filename):
         elif ext.endswith(('.pdf', '.png', '.jpg', '.jpeg')):
             return extract_smart_vision_and_pdf(target_file)
         elif ext.endswith('.xlsx') or ext.endswith('.xls'):
-            return extract_text_from_excel_for_rag(target_file)
+            # Бинарный .xls openpyxl не читает — конверсия через Excel COM с mtime-кэшем
+            # (.cache/converted_xls). Наружу отдаётся только ТЕКСТ: chunk-id остаются от
+            # оригинального пути, self-heal графа и метаданные работают как у .xlsx (v2.1.4).
+            working_file = target_file
+            if ext.endswith('.xls'):
+                converted = _get_or_convert_xls(target_file)
+                if not converted:
+                    return (f"Ошибка: не удалось конвертировать {os.path.basename(target_file)} "
+                            "(.xls → .xlsx) через Excel COM — файл пропущен (проверьте, что он не защищён "
+                            "паролем, не залочен и Excel доступен)")
+                working_file = converted
+            return extract_text_from_excel_for_rag(working_file)
         elif ext.endswith('.graphml'):
             return extract_text_from_graphml(target_file)
         elif ext.endswith('.html'):
@@ -2981,7 +3050,9 @@ def save_file_states(states):
     try:
         file_states_path = os.path.join(get_base_path(), "file_states.json")
         with open(file_states_path, 'w', encoding='utf-8') as f: json.dump(states, f, ensure_ascii=False, indent=2)
-    except: pass
+    except Exception as e:
+        # Инкрементальная надёжность (D-2026-09-24-01): сбой записи states не должен падать молча
+        log_sync.warning("Не удалось сохранить file_states.json: %s", e)
 
 def _keyword_matches_name(keyword, name):
     """Матч ключевого слова против имени файла для list_available_files (D-2026-09-20-02):
@@ -3130,6 +3201,7 @@ def _cleanup_poisoned_vision_cache(collection):
     if os.path.exists(done_flag):
         return
     try:
+        all_ok = True # Флаг пишется ТОЛЬКО при чистом проходе (v2.1.4, #6 ревью); сбой шага — чистка повторится
         cache_dir = os.path.join(get_base_path(), ".cache")
 
         # --- 1. Локальные vision-кэши ---
@@ -3183,6 +3255,7 @@ def _cleanup_poisoned_vision_cache(collection):
                     with open(states_file, 'w', encoding='utf-8') as f:
                         json.dump(states, f, ensure_ascii=False, indent=2)
                 except Exception as se:
+                    all_ok = False
                     log_sync.warning("Очистка: не удалось обновить xwiki_states.json: %s", se)
 
         # --- 3. Отравленные чанки в Chroma + file_states пострадавших файлов ---
@@ -3218,14 +3291,19 @@ def _cleanup_poisoned_vision_cache(collection):
                             json.dump(fs, f, ensure_ascii=False, indent=2)
                         log_sync.info("Очистка: записи о %d пострадавших файлах стёрты из file_states.json (переиндексация)", len(affected))
         except Exception as ce:
+            all_ok = False
             log_sync.warning("Очистка Chroma от отравленных чанков не выполнена: %s", ce)
 
-        # Флаг успешного разового прохода: миграционная чистка не повторяется на следующих синках
-        try:
-            with open(done_flag, "w", encoding="utf-8") as f:
-                f.write(datetime.now().isoformat())
-        except Exception as fe:
-            log_sync.warning("Очистка: не удалось записать флаг .poison_cleanup_done: %s", fe)
+        # Флаг успешного разового прохода: миграционная чистка не повторяется на следующих синках.
+        # При сбое любого шага флаг НЕ пишется — чистка повторится на следующем синке (v2.1.4, #6 ревью).
+        if all_ok:
+            try:
+                with open(done_flag, "w", encoding="utf-8") as f:
+                    f.write(datetime.now().isoformat())
+            except Exception as fe:
+                log_sync.warning("Очистка: не удалось записать флаг .poison_cleanup_done: %s", fe)
+        else:
+            log_sync.warning("Очистка: проход завершён со сбоями — флаг НЕ записан, чистка повторится на следующем синке")
     except Exception as e:
         log_sync.error("Автоочистка отравленных Vision-данных: сбой: %s", e)
 
@@ -3401,7 +3479,9 @@ def sync_vector_db(self=None):
         new_file_states = {}
         files_to_reindex = []
         untranscribed_audio = [] # Список для оповещений
-        failed_paths = [] # Файлы, пропущенные с ошибкой: не фиксируем в состояниях (ретрай на следующем синке)
+        # Инкрементальный file_states.json (D-2026-09-24-01): пул ещё не обработанных
+        # файлов переиндексации; в состояния попадают только полностью обработанные
+        pending_reindex = set()
 
         for file_path in found_files:
             filename = os.path.basename(file_path)
@@ -3426,6 +3506,9 @@ def sync_vector_db(self=None):
 
             if file_path not in file_states or file_states[file_path] != mtime:
                 files_to_reindex.append((file_path, filename))
+
+        # Срез инкрементального сохранения: файлы переиндексации «заморожены» до обработки
+        pending_reindex = {fp for fp, _ in files_to_reindex}
         
         current_files = set(new_file_states.keys())
         stored_files = set(file_states.keys())
@@ -3464,7 +3547,10 @@ def sync_vector_db(self=None):
                 # Логируем ошибку, чтобы она не была тихой
                 if isinstance(text, str) and text.startswith("Ошибка"):
                     log_sync.warning("Индексатор: пропущен файл %s. Причина: %s", filename, text)
-                    failed_paths.append(file_path)
+                    # Файл остаётся вне states (ретрай на следующем синке), прогресс сохраняем инкрементально
+                    new_file_states.pop(file_path, None)
+                    pending_reindex.discard(file_path)
+                    save_file_states({k: v for k, v in new_file_states.items() if k not in pending_reindex})
                     continue
 
                 display_source = filename
@@ -3504,10 +3590,15 @@ def sync_vector_db(self=None):
                         ids=batch_ids[j:j+batch_size],
                         metadatas=batch_metas[j:j+batch_size]
                     )
+                # Файл полностью проиндексирован — фиксируем его в states инкрементально (D-2026-09-24-01)
+                pending_reindex.discard(file_path)
+                save_file_states({k: v for k, v in new_file_states.items() if k not in pending_reindex})
             except Exception as e:
                 log_sync.error("Ошибка индексации файла %s (%s): %s", filename, _classify_net_error(e), e)
-                
-        # Оповещение о нерасшифрованных аудио в чат
+                # Файл остаётся вне states (ретрай на следующем синке), прогресс сохраняем инкрементально
+                new_file_states.pop(file_path, None)
+                pending_reindex.discard(file_path)
+                save_file_states({k: v for k, v in new_file_states.items() if k not in pending_reindex})
         if untranscribed_audio and self is not None:
             unique_audio = list(set(untranscribed_audio))
             display_names = ", ".join(unique_audio[:5]) + ("..." if len(unique_audio) > 5 else "")
@@ -3515,9 +3606,7 @@ def sync_vector_db(self=None):
             self.after(0, lambda m=msg: self.append_to_chat(m))
 
         # Ретрай пропущенных: файл с ошибкой распознавания не «залипает» в состояниях
-        for p in failed_paths:
-            new_file_states.pop(p, None)
-
+        # (покрыто инкрементальными сохранениями выше, D-2026-09-24-01)
         save_file_states(new_file_states)
 
         if self is not None and getattr(self, "current_role", "guest") == "admin":
@@ -5410,19 +5499,21 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.1.3 Enterprise"
+APP_VERSION = "v2.1.6 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
-    "2.1.3 - Ранжирование графового поиска: триплеты сортируются по уровню подтверждения "
-    "(both > partial > none) перед резкой лимитами, файлы внутри триплета — тоже; усиленная "
-    "линковка сущностей (векторный топ-8 + substring-матч по лейблам графа); расширенная "
-    "статистика в логах.\n"
-    "2.1.2 - Единообразие скрытых листов Excel: скрытые листы (hidden/veryHidden) больше не "
-    "попадают в RAG-индексацию и в комментарии вложений чата; точный пере-синк затронутых "
-    "Excel-файлов одноразовым скриптом (scripts/reset_excel_file_states.py).\n"
-    "2.1.1 - Обновление библиотеки векторного поиска (chromadb 1.5.5 → 1.5.9) против известных "
-    "нативных крашей rust-биндингов; пересборка exe. Soак-тест на копии прод-базы пройден.\n"
+    "2.1.6 - Агент научился генерировать и обрабатывать Word-документы (.docx) и оформленные Excel-таблицы (.xlsx) "
+    "через execute_python_code (python-docx/docxtpl/openpyxl); большие docx-вложения (>100 тыс. символов) вместо "
+    "полного текста дают маркер с путём для программной обработки; текстовые правки промптинга, логика песочницы "
+    "не менялась.\n"
+    "2.1.5 - Устойчивость синка/индексации к прерыванию: таймаут 120 с на Vision-вызов, "
+    "постраничный лог и постраничная запись OCR-кэша PDF, инкрементальный file_states.json; "
+    "резолв клика по файлу в чате фоновым потоком (без фриза GUI); ~$ lock-файлы исключены "
+    "из fuzzy-поиска; карта имён inline-иллюстраций в fast-path синка.\n"
+    "2.1.4 - Защита локального кэша XWiki от стирания при частичном сбое синка (пропорциональный "
+    "guard GC); фикс протокола tool-цикла, гонки busy и счётчика шагов агентного цикла; .xls файлы "
+    "теперь индексируются в базе знаний (конверсия через Excel с кэшем).\n"
     "Полная история изменений: docs/DECISIONS.md.\n"
     "\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
@@ -5661,6 +5752,9 @@ class App(ctk.CTk):
 
         self.link_map = {}
         self.link_counter = 0
+        # Антидубль фоновых резолвов клика (D-2026-09-20-опрос #9): имена в активном поиске
+        self._link_lookups = set()
+        self._link_lookups_lock = threading.Lock()
 
         text_widget = self.chat_textbox._textbox
         text_widget.tag_config("hide", elide=True)
@@ -6687,8 +6781,8 @@ class App(ctk.CTk):
                 log_pyexec.warning("Код отклонён deny-листом (шаблон «%s»): %s",
                                    matched_deny, _mask_secrets((code or "")[:200]))
                 return ("Код отклонён из соображений безопасности: обнаружен запрещённый шаблон. "
-                        "Используйте только pandas/openpyxl для анализа Excel, без обращения к сети "
-                        "и файловой системе вне чтения переданного файла.")
+                        "Используйте pandas/openpyxl для анализа Excel и python-docx/docxtpl для Word-документов, "
+                        "без обращения к сети и файловой системе вне чтения переданного файла.")
             # In-process исполнение вместо subprocess: в exe-сборке sys.executable — это SMK_Agent.exe,
             # а не python.exe, поэтому subprocess запускал копию агента (новое окно) и падал по таймауту.
             # Код исполняется в daemon-потоке с перехватом stdout/stderr и лимитом 30 секунд.
@@ -7225,9 +7319,17 @@ class App(ctk.CTk):
                             parsed_raw = read_docx_with_indices(file_path)
                             # Защита от Tuple
                             text_content = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
+                            docx_text_len = len(text_content) if isinstance(text_content, str) else 0
                             comments_count, comments_block = _extract_docx_comments(
                                 file_path,
                                 paras=parsed_raw[1] if isinstance(parsed_raw, tuple) else None)
+                            if docx_text_len > 100000:
+                                text_content = (
+                                    f"Пользователь прикрепил большой Word файл (.docx) по пути: {os.path.abspath(file_path)}. "
+                                    f"Объём текста: {docx_text_len} символов. "
+                                    f"Используй инструмент execute_python_code для программного чтения и обработки этого файла "
+                                    f"(python-docx доступен в песочнице; путь строго из этого сообщения — файл уже локален)."
+                                )
                             
                         elif ext in ['.xlsx', '.xls']:
                             # .xls не читается openpyxl/pandas напрямую — конверсия в .xlsx через Excel COM
@@ -7297,6 +7399,9 @@ class App(ctk.CTk):
                                     # Транзитное сообщение в контекст LLM; в кэш не пишется
                                     text_content = (f"Ошибка распознавания файла {os.path.basename(file_path)} ({ve.kind}). "
                                                     "Сообщи пользователю, что файл временно не удалось распознать, и предложи повторить позже.")
+                                    if ve.failed_pages:
+                                        text_content += (f"\n[Система: нераспознанные страницы: {', '.join(map(str, ve.failed_pages))}; "
+                                                         "частично распознанное сохранено в кэше и будет до-распознано при повторе.]")
                             else:
                                 text_content = extract_text_from_pdf(file_path)
                                 
@@ -7308,6 +7413,9 @@ class App(ctk.CTk):
                                 # Транзитное сообщение в контекст LLM; в кэш не пишется
                                 text_content = (f"Ошибка распознавания файла {os.path.basename(file_path)} ({ve.kind}). "
                                                 "Сообщи пользователю, что файл временно не удалось распознать, и предложи повторить позже.")
+                                if ve.failed_pages:
+                                    text_content += (f"\n[Система: нераспознанные страницы: {', '.join(map(str, ve.failed_pages))}; "
+                                                     "частично распознанное сохранено в кэше и будет до-распознано при повторе.]")
                             
                         elif ext in ['.doc', '.rtf']:
                             # Вложения используют безопасную локальную песочницу
@@ -7597,35 +7705,66 @@ class App(ctk.CTk):
                     webbrowser.open(filename)
                     break
                 if filename:
-                    # Используем наш новый универсальный локатор (с нечётким фолбэком, D-2026-09-20-02)
-                    target_file = find_target_file(filename)
-                    if not target_file:
-                        target_file = find_target_file(filename, allow_fuzzy=True)
-                    
-                    if target_file and os.path.exists(target_file):
-                        resolved_name = _strip_attach_hash_prefix(os.path.basename(target_file))
-                        if self.current_role == "guest":
-                            base_name = os.path.basename(target_file)
-                            safe_filename = f"СМК_Чтение_{base_name}"
-                            safe_path = os.path.join(tempfile.gettempdir(), safe_filename)
-                            shutil.copy2(target_file, safe_path)
-                            self.append_to_chat(f"\n[Система: Guest-режим. Открываем безопасную копию: '{safe_path}']\n")
-                            os.startfile(os.path.abspath(safe_path))
-                        else:
-                            self.append_to_chat(f"\n[Система: Admin-режим. Открываем оригинал файла '{resolved_name}']\n")
-                            os.startfile(os.path.abspath(target_file))
-                    else:
-                        suggestions = _suggest_similar_files(filename)
-                        err = f"[Система: Файл '{filename}' не найден в разрешенных директориях]\n"
-                        if suggestions:
-                            err = f"[Система: Файл '{filename}' не найден в разрешенных директориях. Ближайшие совпадения: {'; '.join(suggestions)}]\n"
-                        self.append_to_chat(err)
+                    # Резолв клика фоновым потоком (#9, D-2026-09-28): промах — это полный
+                    # обход корпуса (+difflib), в GUI-потоке он даёт фриз. Первый отклик — мгновенный.
+                    self._start_link_lookup(filename)
                 break
             elif tag.startswith("weblink_"):
                 url = self.link_map.get(tag)
                 if url:
                     webbrowser.open(url)
                 break
+
+    def _start_link_lookup(self, filename):
+        """Асинхронный резолв имени файла из клика: ОДИН вызов find_target_file с
+        allow_fuzzy=True (строгое равенство проверяется в том же обходе и возвращается
+        до fuzzy-стадий), при промахе — подсказки. Открытие файла — в GUI-потоке
+        через self.after. Антидубль по имени через self._link_lookups (#9)."""
+        with self._link_lookups_lock:
+            if filename in self._link_lookups:
+                return
+            self._link_lookups.add(filename)
+
+        def worker():
+            try:
+                target_file = find_target_file(filename, allow_fuzzy=True)
+                suggestions = []
+                if not target_file:
+                    suggestions = _suggest_similar_files(filename)
+                self.after(0, lambda: self._finish_link_lookup(filename, target_file, suggestions))
+            except Exception as e:
+                self.after(0, lambda: self._finish_link_lookup(filename, None, [f"Ошибка поиска: {e}"]))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_link_lookup(self, filename, target_file, suggestions):
+        try:
+            with self._link_lookups_lock:
+                self._link_lookups.discard(filename)
+        except Exception:
+            pass
+        self._open_resolved_file(filename, target_file, suggestions or [])
+
+    def _open_resolved_file(self, filename, target_file, suggestions=()):
+        """Открытие/отчёт по резолвнутому файлу. Только GUI-поток (os.startfile,
+        shutil.copy2, append_to_chat не thread-safe)."""
+        if target_file and os.path.exists(target_file):
+            resolved_name = _strip_attach_hash_prefix(os.path.basename(target_file))
+            if self.current_role == "guest":
+                base_name = os.path.basename(target_file)
+                safe_filename = f"СМК_Чтение_{base_name}"
+                safe_path = os.path.join(tempfile.gettempdir(), safe_filename)
+                shutil.copy2(target_file, safe_path)
+                self.append_to_chat(f"\n[Система: Guest-режим. Открываем безопасную копию: '{safe_path}']\n")
+                os.startfile(os.path.abspath(safe_path))
+            else:
+                self.append_to_chat(f"\n[Система: Admin-режим. Открываем оригинал файла '{resolved_name}']\n")
+                os.startfile(os.path.abspath(target_file))
+        else:
+            err = f"[Система: Файл '{filename}' не найден в разрешенных директориях]\n"
+            if suggestions:
+                err = f"[Система: Файл '{filename}' не найден в разрешенных директориях. Ближайшие совпадения: {'; '.join(suggestions)}]\n"
+            self.append_to_chat(err)
     
     def load_history(self):
         try:
@@ -8462,6 +8601,10 @@ class App(ctk.CTk):
             if not (settings_window.winfo_exists() and api_reasoning_combo.winfo_exists()):
                 return
             selected_model = model_entry.get().strip()
+            # Пустая карта (оффлайн/первые секунды/сбой загрузки): не трогаем комбо и
+            # уровень reasoning — иначе сохранение персистирует понижение (#7, D-2026-09-28)
+            if not self.model_reasoning_map:
+                return
             info = self.get_model_reasoning_info(selected_model)
             if info and info.get("efforts"):
                 new_values = ["Отключено"] + list(info["efforts"])
@@ -9597,11 +9740,11 @@ class App(ctk.CTk):
                 "type": "function",
                 "function": {
                     "name": "execute_python_code",
-                    "description": "Выполняет Python код. Используется для анализа Excel файлов с помощью pandas. Возвращает stdout. Путь к прикреплённому файлу берите строго из системного промпта — файл уже локален, не используйте сетевые пути без прямой необходимости.",
+                    "description": "Выполняет Python код. Используется для анализа Excel (pandas), а также для генерации и оформления файлов с нуля или из данных пользователя: Word (.docx) через python-docx/docxtpl, Excel (.xlsx) через openpyxl — когда нужен полный контроль над структурой и оформлением. Создавайте новые файлы в текущей рабочей папке (короткое имя без пути). Возвращает stdout. Путь к прикреплённому файлу берите строго из системного промпта — файл уже локален, не используйте сетевые пути без прямой необходимости.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "code": {"type": "string", "description": "Python код для выполнения. Используй pandas для работы с Excel."}
+                            "code": {"type": "string", "description": "Python код для выполнения. Используй pandas/openpyxl для Excel и python-docx/docxtpl для Word."}
                         },
                         "required": ["code"]
                     }
@@ -9945,6 +10088,11 @@ class App(ctk.CTk):
         # ЭШЕЛОН 6: Генерируем название сессии ТОЛЬКО если это Админ
         if len(self.chat_history) == 1 and getattr(self, "current_role", "guest") == "admin":
             threading.Thread(target=self.generate_session_title_background, args=(user_text,), daemon=True).start()
+        # Флаг ставится СИНХРОННО в GUI-потоке прямо перед стартом потока (v2.1.4, #3 ревью):
+        # прежняя установка в worker-потоке оставляла окно на двойной Enter → два параллельных забега.
+        # Если между guard и start случится исключение — finally agent_loop не наступит, поэтому
+        # ставим именно здесь, последней операцией перед start().
+        self.agent_busy = True
         threading.Thread(target=self.agent_loop, daemon=True).start()
 
     def agent_loop(self):
@@ -10023,7 +10171,10 @@ class App(ctk.CTk):
         
         excel_params = self.get_excel_params()
         has_excel_context = any(
-            isinstance(v, str) and ("execute_python_code" in v or "большой Excel файл" in v)
+            isinstance(v, str) and (
+                "большой Excel файл" in v
+                or ("execute_python_code" in v and "большой Word файл" not in v)
+            )
             for v in getattr(self, "chat_attachments_dict", {}).values()
         )
         
@@ -10039,8 +10190,10 @@ class App(ctk.CTk):
         run_log = []
         stopped = False
         loop_counts = {}
+        pending_loop_warnings = [] # Предупреждения циклов накапливаются и встают ПОСЛЕ tool-результатов (v2.1.4)
+        n0 = len(messages_for_llm) # Срез начала забега: счётчик шагов считает только ЕГО assistant-сообщения (v2.1.4)
 
-        self.agent_busy = True
+        # agent_busy уже установлен в send_message перед стартом потока (v2.1.4) — здесь не дублируем
         self.after(0, lambda: self._set_send_mode(True))
         try:
             for step in range(max_steps):
@@ -10332,18 +10485,16 @@ class App(ctk.CTk):
                             call_key = (func_name, json.dumps(args, sort_keys=True, ensure_ascii=False))
                             loop_counts[call_key] = loop_counts.get(call_key, 0) + 1
                             if loop_counts[call_key] == 2:
-                                messages_for_llm.append({
-                                    "role": "user",
-                                    "content": f"[СИСТЕМНОЕ УКАЗАНИЕ] Ты повторяешь тот же вызов '{func_name}' с теми же аргументами. Измени формулировку запроса или переходи к финальному ответу."
-                                })
-                                self.after(0, self.append_to_chat, "\n[⚠️ Одинаковый вызов инструмента повторяется — Агенту отправлено предупреждение]\n", "system")
+                                # Предупреждение НЕ вставляется внутри tool-цикла: user-сообщение между
+                                # assistant(tool_calls) и его tool-результатами ломает протокол (400).
+                                pending_loop_warnings.append(f"[СИСТЕМНОЕ УКАЗАНИЕ] Ты повторяешь тот же вызов '{func_name}' с теми же аргументами. Измени формулировку запроса или переходи к финальному ответу.")
                             elif loop_counts[call_key] >= 3:
                                 loop_forced = True
 
                         # Выводим аккуратный лог действия с отступом, БЕЗ дублирования бейджа
                         self.after(0, self.append_to_chat, f"  ⚙️ [Действие: {func_name}]...\n", "tool_call")
                         if func_name == "execute_python_code":
-                            self.after(0, lambda: self.append_to_chat("\n[⏳ Агент анализирует данные Excel и выполняет вычисления...]\n"))
+                            self.after(0, lambda: self.append_to_chat("\n[⏳ Агент выполняет Python-код: анализ данных и обработка файлов...]\n"))
                             self.after(0, self.update_idletasks)
 
                         # Особая обработка поиска по базе знаний: поддержка Rerank (Advanced RAG)
@@ -10376,6 +10527,14 @@ class App(ctk.CTk):
                     if loop_forced:
                         stopped = True
                         break
+
+                    # Предупреждения о повторах встают ПОСЛЕ всех tool-результатов шага —
+                    # несколько подряд user-сообщений API допустимы (v2.1.4, #2 ревью)
+                    for _lw in pending_loop_warnings:
+                        messages_for_llm.append({"role": "user", "content": _lw})
+                    if pending_loop_warnings:
+                        self.after(0, self.append_to_chat, "\n[⚠️ Одинаковый вызов инструмента повторяется — Агенту отправлено предупреждение]\n", "system")
+                        pending_loop_warnings = []
                      
                 except Exception as e:
                     error_str = str(e).lower()
@@ -10397,11 +10556,11 @@ class App(ctk.CTk):
                     self.save_history()
                     self.save_current_session()
                 else:
-                    self._agent_finalize(f"Лимит шагов исчерпан ({max_steps})", messages_for_llm, run_log, agent_msg_id)
+                    self._agent_finalize(f"Лимит шагов исчерпан ({max_steps})", messages_for_llm, run_log, agent_msg_id, n0=n0)
 
             if stopped:
                 if excel_mode:
-                    steps_done = sum(1 for m in messages_for_llm if m.get("role") == "assistant")
+                    steps_done = sum(1 for m in messages_for_llm[n0:] if m.get("role") == "assistant")
                     stop_note = (f"⏹ Остановлено пользователем (выполнено шагов цикла: {steps_done}).\n"
                                  f"Механическая сводка забега:\n{self._agent_summary_text(run_log, steps_done=steps_done)}")
                     self.append_to_chat(f"\n{stop_note}\n\n")
@@ -10409,7 +10568,7 @@ class App(ctk.CTk):
                     self.save_history()
                     self.save_current_session()
                 else:
-                    self._agent_finalize("Остановлено пользователем", messages_for_llm, run_log, agent_msg_id)
+                    self._agent_finalize("Остановлено пользователем", messages_for_llm, run_log, agent_msg_id, n0=n0)
         finally:
             self.agent_busy = False
             self.after(0, lambda: self._set_send_mode(False))
@@ -10439,7 +10598,7 @@ class App(ctk.CTk):
             lines.append(f"  Выполнено шагов цикла: {steps_done}")
         return "\n".join(lines)
 
-    def _agent_finalize(self, reason, messages_for_llm, run_log, agent_msg_id):
+    def _agent_finalize(self, reason, messages_for_llm, run_log, agent_msg_id, n0=None):
         try:
             has_tool_results = any(m.get("role") == "tool" for m in messages_for_llm)
             if not run_log and not has_tool_results:
@@ -10450,7 +10609,8 @@ class App(ctk.CTk):
                 self.save_current_session()
                 return
 
-            steps_done = sum(1 for m in messages_for_llm if m.get("role") == "assistant")
+            # n0 задаёт срез начала забега — считаем только шаги ЭТОГО забега, без истории чата (v2.1.4)
+            steps_done = sum(1 for m in (messages_for_llm[n0:] if n0 is not None else messages_for_llm) if m.get("role") == "assistant")
             summary = self._agent_summary_text(run_log, steps_done=steps_done)
             self.append_to_chat(f"\n📋 {reason}. Механическая сводка забега:\n{summary}\n")
 

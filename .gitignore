@@ -36,3 +36,6 @@ backup_smk_vector_db_*/
 soak_copy_*/
 .tmp_diag_prod_graph/
 soak_crash.log
+
+# Скрипт-тесты (верификация планов) — остаются локально, на GitHub не выкладываются
+scripts/test_*.py
