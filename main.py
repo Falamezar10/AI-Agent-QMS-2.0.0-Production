@@ -436,6 +436,9 @@ def get_vault_data():
         "openrouter_key": os.getenv("OPENROUTER_API_KEY", "").strip(),
         "groq_key": "",
         "tavily_key": "",
+        "opencode_key": os.getenv("OPENCODE_API_KEY", "").strip(),
+        "commandcode_key": os.getenv("COMMANDCODE_API_KEY", "").strip(),
+        "custom_llm_key": os.getenv("CUSTOM_LLM_API_KEY", "").strip(),
         "admin_password": "admin",
         "sync_password": "",
         "xwiki_login": "",
@@ -456,6 +459,9 @@ def get_vault_data():
             "openrouter_key": str(data.get("openrouter_key", default_vault["openrouter_key"])).strip(),
             "groq_key": str(data.get("groq_key", "")).strip(),
             "tavily_key": str(data.get("tavily_key", "")).strip(),
+            "opencode_key": str(data.get("opencode_key", default_vault["opencode_key"])).strip(),
+            "commandcode_key": str(data.get("commandcode_key", default_vault["commandcode_key"])).strip(),
+            "custom_llm_key": str(data.get("custom_llm_key", default_vault["custom_llm_key"])).strip(),
             "admin_password": str(data.get("admin_password", "admin")).strip() or "admin",
             "sync_password": str(data.get("sync_password", "")).strip(),
             "xwiki_login": str(data.get("xwiki_login", "")).strip(),
@@ -472,6 +478,9 @@ def save_vault_data(data):
             "openrouter_key": str(data.get("openrouter_key", "")).strip(),
             "groq_key": str(data.get("groq_key", "")).strip(),
             "tavily_key": str(data.get("tavily_key", "")).strip(),
+            "opencode_key": str(data.get("opencode_key", "")).strip(),
+            "commandcode_key": str(data.get("commandcode_key", "")).strip(),
+            "custom_llm_key": str(data.get("custom_llm_key", "")).strip(),
             "admin_password": str(data.get("admin_password", "admin")).strip() or "admin",
             "sync_password": str(data.get("sync_password", "")).strip(),
             "xwiki_login": str(data.get("xwiki_login", "")).strip(),
@@ -537,6 +546,233 @@ def get_llm_client():
                                                  api_key=openrouter_key, http_client=http_client)
             _LLM_CLIENT_CACHE["sig"] = sig
         return _LLM_CLIENT_CACHE["client"]
+
+
+# ==================== СМЕНЯЕМЫЙ ПРОВАЙДЕР ОСНОВНОЙ ЧАТ-МОДЕЛИ (v2.2.0) ====================
+# Реестр OpenAI-совместимых провайдеров ПОД ОСНОВНУЮ чат-модель (чат гостя/админа, Секретарь,
+# smart-инструменты, Deep Audit). Сервисная обвязка (эмбеддинги, Vision OCR, граф-паук, rerank,
+# аудио) «прибита» к get_llm_client()/OpenRouter и от этого реестра НЕ зависит.
+# Новый OpenAI-совместимый провайдер = одна запись реестра + ключ в Vault.
+_LLM_PROVIDERS = {
+    "OpenRouter": {
+        "base_url": "https://openrouter.ai/api/v1", "key_field": "openrouter_key",
+        "env_var": "OPENROUTER_API_KEY", "catalog": "openrouter",
+        "reasoning": "openrouter_extra_body", "use_proxy_default": False
+    },
+    "OpenCode Go": {
+        "base_url": "https://opencode.ai/zen/go/v1", "key_field": "opencode_key",
+        "env_var": "OPENCODE_API_KEY", "catalog": "openai_generic",
+        "reasoning": "none", "use_proxy_default": False
+    },
+    "CommandCode": {
+        "base_url": "https://api.commandcode.ai/provider/v1", "key_field": "commandcode_key",
+        "env_var": "COMMANDCODE_API_KEY", "catalog": "openai_generic",
+        "reasoning": "none", "use_proxy_default": False
+    },
+    "Custom": {
+        "base_url": "", "key_field": "custom_llm_key",
+        "env_var": "CUSTOM_LLM_API_KEY", "catalog": "openai_generic",
+        "reasoning": "none", "use_proxy_default": False
+    }
+}
+
+def _model_is_free_by_price(model):
+    """True, если в метаданных модели видна БЕСПЛАТНАЯ цена (идея пользователя 2026-10-28:
+    2026-10-28: для гостя фильтровать по цене, а не по суффиксу id). Поддержаны формы, которые
+    встречаются в каталогах-дэшбордах: OpenRouter-стиль {\"pricing\": {\"prompt\"/\"completion\"}},
+    строка \"Free\"/0 в pricing, нули или \"$0.00\"/\"Free\" в полях input/output/prompt/completion.
+    Ложь (None/отсутствие цен) — не бесплатная или неизвестно."""
+    if not isinstance(model, dict):
+        return False
+    pricing = model.get("pricing")
+    if isinstance(pricing, dict):
+        for v in list(pricing.values()) + [pricing]:
+            s = str(v).strip().lower()
+            if s == "free":
+                return True
+            try:
+                if abs(float(s.replace("$", "").replace(",", ""))) < 1e-9:
+                    return True
+            except Exception:
+                continue
+    elif pricing is not None:
+        s = str(pricing).strip().lower()
+        if s == "free":
+            return True
+        try:
+            if abs(float(s.replace("$", "").replace(",", ""))) < 1e-9:
+                return True
+        except Exception:
+            pass
+    for key in ("input", "output", "prompt", "completion", "price", "cost"):
+        value = model.get(key)
+        if value is None:
+            continue
+        s = str(value).strip().lower()
+        if s == "free":
+            return True
+        try:
+            if abs(float(s.replace("$", "").replace(",", ""))) < 1e-9:
+                return True
+        except Exception:
+            continue
+    return False
+
+def _filter_provider_models_catalog(provider_id, models):
+    """Жёсткий фильтр каталога GET /models (v2.2.0, решение 6 плана; чистая функция — тестируется
+    без сети на фикстуре). CommandCode: только модели с '/chat/completions' в supported_endpoints
+    (нативные форматы /responses, /messages в v1 не используются); пустой результат фильтра при
+    непустом API-ответе → фолбэк «показываем ВСЕ модели» (счётчик недоступных обнуляется).
+    OpenCode Go/Custom: метаданных форматов нет — показываем всех (счётчик недоступных невозможен).
+    Возвращает (available, unavailable, fallback_all)."""
+    available, unavailable = [], 0
+    for model in models or []:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("id") or "").strip()
+        if not model_id:
+            continue
+        if provider_id == "CommandCode":
+            # supported_endpoints — надёжный фильтр (live-проба 2026-10-16 подтвердила поле)
+            endpoints = [str(e) for e in (model.get("supported_endpoints") or [])]
+            if any("/chat/completions" in e for e in endpoints):
+                available.append(model_id)
+            else:
+                unavailable += 1
+        else:
+            # OpenCode Go / Custom: метаданных форматов нет — показываем всех
+            available.append(model_id)
+    fallback_all = False
+    if provider_id == "CommandCode" and not available and models:
+        fallback_all = True
+        available = [str(m.get("id")).strip() for m in models
+                     if isinstance(m, dict) and str(m.get("id") or "").strip()]
+        unavailable = 0
+    return available, unavailable, fallback_all
+
+def _get_active_llm_provider(role=None):
+    """Провайдер основной чат-модели из настроек НА ДИСКЕ. С v2.2.0 выбор по РОЛИ
+    (решение пользователя 2026-10-29): role_llm_provider["admin"/"guest"] задан → он;
+    кривой/незаданный role-выбор → общий llm_provider (выбор админа); неизвестный общий → OpenRouter."""
+    try:
+        local = load_local_settings()
+    except Exception:
+        local = {}
+    rlp = local.get("role_llm_provider")
+    if isinstance(rlp, dict) and role in ("admin", "guest"):
+        role_choice = str(rlp.get(role) or "").strip()
+        if role_choice and role_choice in _LLM_PROVIDERS:
+            return role_choice
+    provider = str(local.get("llm_provider") or "OpenRouter").strip()
+    return provider if provider in _LLM_PROVIDERS else "OpenRouter"
+
+def _get_chat_model_for_role(app_instance=None, role=None):
+    """ID модели основной чат-модели для роли. Провайдер — по роли (role_llm_provider, решение
+    2026-10-29: гость выбирает провайдера; общий llm_provider — фолбэк/выбор админа), модель —
+    слот роли из настройки provider_llm_models (провайдер -> {admin/guest/secretary/auditor: id});
+    пустой слот → легаси-фолбэк (admin_model/guest_model/auditor_model из local_settings;
+    secretary_model из global_settings). Роль app_instance резолвится по
+    getattr(app_instance, "current_role", "guest"); app_instance=None → guest.
+    role="secretary"/"auditor"/"admin"/"guest" — явное указание (провайдер см. выше:
+    admin/guest — по своей роли; secretary/auditor — по роли сессии; слот модели — по ЯВНОЙ роли).
+    Возвращает (провайдер, id_модели); пустая модель — легитимное значение (гард у вызывающего)."""
+    session_role = "admin" if getattr(app_instance, "current_role", "guest") == "admin" else "guest"
+    provider = _get_active_llm_provider(role if role in ("admin", "guest") else session_role)
+    try:
+        local = load_local_settings()
+    except Exception:
+        local = {}
+    slots = local.get("provider_llm_models")
+    if not isinstance(slots, dict):
+        slots = {}
+    provider_slots = slots.get(provider) if isinstance(slots.get(provider), dict) else {}
+    model = ""
+    model_role = session_role
+    if role == "secretary":
+        model_role = "secretary"
+        model = str(provider_slots.get("secretary") or "").strip()
+        if not model:
+            try:
+                model = str(load_global_settings().get("secretary_model", "") or "").strip()
+            except Exception:
+                model = ""
+    else:
+        if role in ("admin", "guest", "auditor"):
+            model_role = role
+        model = str(provider_slots.get(model_role) or "").strip()
+        if not model:
+            legacy_key = {"admin": "admin_model", "guest": "guest_model", "auditor": "auditor_model"}[model_role]
+            model = str(local.get(legacy_key, "") or "").strip()
+    if model_role == "guest":
+        model = _guest_free_model_guard(app_instance, provider, model)
+    return provider, model or ""
+
+_GUEST_GUARD_LOCK = threading.Lock()
+_GUEST_GUARD_LOGGED = set()
+
+def _guest_free_model_guard(app_instance, provider, model):
+    """Гостю платная модель недоступна (обратная связь 2026-10-28): paid-слот не должен дойти
+    до чата. Если известен список бесплатных и слот в него не входит — подмена на первую
+    бесплатную. Custom не ограничивается (сервер админа); данных о бесплатных нет — модель
+    не трогаем (легитимный слот от админа, безопасный фолбэк). Подмена логируется один раз
+    на комбинацию (не спамим на каждом шаге agent_loop)."""
+    model = str(model or "").strip()
+    if provider == "Custom" or not model or app_instance is None:
+        return model
+    try:
+        if provider == "OpenRouter":
+            free_list = [str(x) for x in (getattr(app_instance, "free_models_list", []) or [])]
+        else:
+            fb = getattr(app_instance, "provider_free_by_price", None)
+            free_list = sorted(fb.get(provider) or []) if isinstance(fb, dict) else []
+        if free_list and model not in free_list:
+            fixed = free_list[0]
+            key = (provider, model, fixed)
+            with _GUEST_GUARD_LOCK:
+                if key not in _GUEST_GUARD_LOGGED:
+                    _GUEST_GUARD_LOGGED.add(key)
+                    log_core.info("Гостевая модель '%s' не входит в бесплатные %s — чат переключён на '%s'",
+                                  model, provider, fixed)
+            return fixed
+    except Exception:
+        pass
+    return model
+
+_CHAT_CLIENT_LOCK = threading.Lock()
+_CHAT_CLIENT_CACHE = {"client": None, "sig": None}
+
+def get_chat_llm_client(role=None):
+    """Клиент ОСНОВНОЙ чат-модели по провайдеру роли (role_llm_provider; роль сессии —
+    role="admin"/"guest"; role=None → общий выбор), настройки — с диска.
+    Прокси: OpenRouter — глобальный use_proxy (как get_llm_client); остальные — per-провайдер
+    provider_use_proxy (дефолт из реестра, geоблок по умолчанию НЕ предполагает прокси).
+    Кэш с инвалидацией по сигнатуре (провайдер, base_url, ключ, прокси-URL) — по образцу get_llm_client."""
+    try:
+        local = load_local_settings()
+    except Exception:
+        local = {}
+    provider = _get_active_llm_provider(role)
+    reg = _LLM_PROVIDERS[provider]
+    base_url = reg["base_url"]
+    if provider == "Custom":
+        base_url = str(local.get("custom_llm_base_url") or "").strip()
+    vault_data = get_vault_data()
+    api_key = vault_data.get(reg["key_field"], "").strip() or os.getenv(reg["env_var"], "").strip()
+    if provider == "OpenRouter":
+        use_proxy = bool(local.get("use_proxy", False))
+    else:
+        pap = local.get("provider_use_proxy")
+        use_proxy = bool(pap.get(provider, reg["use_proxy_default"])) if isinstance(pap, dict) else bool(reg["use_proxy_default"])
+    proxy_url = None
+    if use_proxy:
+        proxy_url = f"socks5h://{local.get('proxy_host', '127.0.0.1')}:{local.get('proxy_port', '2080')}"
+    sig = (provider, base_url, api_key, proxy_url)
+    with _CHAT_CLIENT_LOCK:
+        if _CHAT_CLIENT_CACHE["sig"] != sig or _CHAT_CLIENT_CACHE["client"] is None:
+            http_client = httpx.Client(proxy=proxy_url) if proxy_url else None
+            _CHAT_CLIENT_CACHE["client"] = OpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
+            _CHAT_CLIENT_CACHE["sig"] = sig
+        return _CHAT_CLIENT_CACHE["client"]
 
 
 class VisionAPIError(Exception):
@@ -4850,11 +5086,8 @@ def smart_excel_search(filename, task_description, only_open=False, app_instance
 
     try:
         global_settings = load_global_settings()
-        local_settings = load_local_settings()
-        if getattr(app_instance, "current_role", "guest") == "admin":
-            current_model = local_settings.get("admin_model", "openai/gpt-4o-mini")
-        else:
-            current_model = local_settings.get("guest_model", "stepfun/step-3.5-flash:free")
+        # v2.2.0: роль-модели через helper активного чат-провайдера (легаси-фолбэк внутри helper)
+        provider_name, current_model = _get_chat_model_for_role(app_instance)
         wb = openpyxl.load_workbook(target_file, data_only=True)
         sheet_names = [sheet.title for sheet in wb.worksheets if sheet.sheet_state == 'visible']
         
@@ -4868,7 +5101,7 @@ def smart_excel_search(filename, task_description, only_open=False, app_instance
             scout_data[sheet] = preview
             
         scout_prompt = "Ты Архитектор БД. Выбери 'target_sheet' и 'header_row_index' (строку с заголовками).\nВерни СТРОГО JSON: {\"target_sheet\": \"ИмяЛиста\", \"header_row_index\": 2}"
-        scout_resp = get_llm_client().chat.completions.create(
+        scout_resp = get_chat_llm_client(role=getattr(app_instance, "current_role", "guest")).chat.completions.create(
             model=current_model, response_format={"type": "json_object"},
             messages=[{"role": "system", "content": scout_prompt}, {"role": "user", "content": f"Задача: {task_description}\n\nСтруктура:\n{json.dumps(scout_data, ensure_ascii=False)}"}]
         )
@@ -4901,7 +5134,7 @@ def smart_excel_search(filename, task_description, only_open=False, app_instance
             "3. МУЛЬТИ-КОЛОНОЧНОСТЬ: ОБЯЗАТЕЛЬНО выбери МИНИМУМ 3 РАЗНЫЕ КОЛОНКИ для поиска (например: процесс, описание, причина). Если колонок мало, выбери все возможные. Это критически важно! Не ленись!\n\n"
             "Верни JSON: {\"search_rules\": [{\"column\": \"Точное Имя\", \"keywords\": [\"корень\"]}]}"
         )
-        radar_resp = get_llm_client().chat.completions.create(
+        radar_resp = get_chat_llm_client(role=getattr(app_instance, "current_role", "guest")).chat.completions.create(
             model=current_model, response_format={"type": "json_object"},
             messages=[{"role": "system", "content": radar_prompt}, {"role": "user", "content": f"Задача: {task_description}\nКолонки: {headers_list}\nПримеры: {json.dumps(sample_for_radar[:3], ensure_ascii=False)}"}]
         )
@@ -4958,12 +5191,9 @@ def smart_excel_edit(filename, task_description, found_context_str, app_instance
 
     try:
         global_settings = load_global_settings()
-        local_settings = load_local_settings()
-        if getattr(app_instance, "current_role", "guest") == "admin":
-            current_model = local_settings.get("admin_model", "openai/gpt-4o-mini")
-        else:
-            current_model = local_settings.get("guest_model", "stepfun/step-3.5-flash:free")
-        
+        # v2.2.0: роль-модели через helper активного чат-провайдера (легаси-фолбэк внутри helper)
+        provider_name, current_model = _get_chat_model_for_role(app_instance)
+
         base, ext = os.path.splitext(target_file)
         out_path = f"{base}_Правки{ext}"
         shutil.copy2(target_file, out_path)
@@ -4972,7 +5202,7 @@ def smart_excel_edit(filename, task_description, found_context_str, app_instance
         sheet_names = [sheet.title for sheet in wb.worksheets if sheet.sheet_state == 'visible']
         
         scout_data = {s: [f"Строка {i}: {row}" for i, row in enumerate(wb[s].iter_rows(min_row=1, max_row=5, values_only=True), 1)] for s in sheet_names}
-        scout_resp = get_llm_client().chat.completions.create(
+        scout_resp = get_chat_llm_client(role=getattr(app_instance, "current_role", "guest")).chat.completions.create(
             model=current_model, response_format={"type": "json_object"},
             messages=[{"role": "system", "content": "Верни JSON: {\"target_sheet\": \"Имя\", \"header_row_index\": 2}"}, 
                       {"role": "user", "content": f"Задача: {task_description}\nСтруктура: {json.dumps(scout_data, ensure_ascii=False)}"}]
@@ -5015,7 +5245,7 @@ def smart_excel_edit(filename, task_description, found_context_str, app_instance
         if found_context_str: user_prompt += f"НАЙДЕННЫЕ СТРОКИ ДЛЯ ОБНОВЛЕНИЯ:\n{found_context_str}\n"
         user_prompt += f"ПОСЛЕДНИЕ СТРОКИ (Стиль): {json.dumps(last_15_rows, ensure_ascii=False)}"
 
-        gen_resp = get_llm_client().chat.completions.create(
+        gen_resp = get_chat_llm_client(role=getattr(app_instance, "current_role", "guest")).chat.completions.create(
             model=current_model, response_format={"type": "json_object"},
             messages=[{"role": "system", "content": gen_prompt}, {"role": "user", "content": user_prompt}]
         )
@@ -5106,12 +5336,9 @@ def generate_document_from_template(template_filename, task_description, new_fil
             '{"edits": [{"target_indices": [3, 4], "new_text": "Новый текст или delete"}]}\n'
         )
         
-        local_settings = load_local_settings()
-        if getattr(app_instance, "current_role", "guest") == "admin":
-            current_model = local_settings.get("admin_model", "openai/gpt-4o-mini")
-        else:
-            current_model = local_settings.get("guest_model", "stepfun/step-3.5-flash:free")
-        response = get_llm_client().chat.completions.create(
+        # v2.2.0: роль-модели через helper активного чат-провайдера (легаси-фолбэк внутри helper)
+        provider_name, current_model = _get_chat_model_for_role(app_instance)
+        response = get_chat_llm_client(role=getattr(app_instance, "current_role", "guest")).chat.completions.create(
             model=current_model,
             response_format={"type": "json_object"},
             messages=[
@@ -5205,12 +5432,9 @@ def generate_document_from_scratch(task_description, new_filename, reference_fil
         if ref_text:
             user_prompt += f"\nДля понимания стиля компании, вот пример корпоративного документа (используй тональность, но не копируй слепо):\n{ref_text[:3000]}"
             
-        local_settings = load_local_settings()
-        if getattr(app_instance, "current_role", "guest") == "admin":
-            current_model = local_settings.get("admin_model", "openai/gpt-4o-mini")
-        else:
-            current_model = local_settings.get("guest_model", "stepfun/step-3.5-flash:free")
-        response = get_llm_client().chat.completions.create(
+        # v2.2.0: роль-модели через helper активного чат-провайдера (легаси-фолбэк внутри helper)
+        provider_name, current_model = _get_chat_model_for_role(app_instance)
+        response = get_chat_llm_client(role=getattr(app_instance, "current_role", "guest")).chat.completions.create(
             model=current_model, response_format={"type": "json_object"},
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         )
@@ -5296,12 +5520,9 @@ def generate_excel_from_scratch(task_description, new_filename, app_instance=Non
             "{\"sheets\": [{\"sheet_name\": \"Риски\", \"headers\": [\"№\", \"Риск\"], \"rows\": [[\"1\", \"Отказ\"]]}, {\"sheet_name\": \"Справочник\", \"headers\": [\"ID\", \"Значение\"], \"rows\": [[\"A1\", \"Сервер\"]]}]}"
         )
         
-        local_settings = load_local_settings()
-        if getattr(app_instance, "current_role", "guest") == "admin":
-            current_model = local_settings.get("admin_model", "openai/gpt-4o-mini")
-        else:
-            current_model = local_settings.get("guest_model", "stepfun/step-3.5-flash:free")
-        response = get_llm_client().chat.completions.create(
+        # v2.2.0: роль-модели через helper активного чат-провайдера (легаси-фолбэк внутри helper)
+        provider_name, current_model = _get_chat_model_for_role(app_instance)
+        response = get_chat_llm_client(role=getattr(app_instance, "current_role", "guest")).chat.completions.create(
             model=current_model,
             response_format={"type": "json_object"},
             messages=[
@@ -5415,6 +5636,11 @@ DEFAULT_LOCAL_SETTINGS = {
     "use_proxy": False,
     "proxy_host": "127.0.0.1",
     "proxy_port": "2080",
+    "llm_provider": "OpenRouter",
+    "role_llm_provider": {},  # v2.2.0: выбор провайдера по роли {"admin": id, "guest": id}; пусто → llm_provider
+    "provider_llm_models": {},
+    "provider_use_proxy": {},
+    "custom_llm_base_url": "",
     "auto_read_files": True,
     "deep_audit_enabled": False,
     "auditor_model": "",
@@ -5499,21 +5725,22 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.1.6 Enterprise"
+APP_VERSION = "v2.2.1 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
+    "2.2.1 - Copy/Paste и горячие клавиши при русской раскладке: Ctrl+C/X/V/A работают в чате, чат-логе "
+    "и всех полях настроек без переключения раскладки (маршрут по кириллическому event.char); "
+    "аудио-хоткей дублируется кириллическим нажатием.\n"
+    "2.2.0 - Сменяемый провайдер основной чат-модели (OpenRouter / OpenCode Go / CommandCode / свой "
+    "OpenAI-совместимый) на вкладке «Модели»: слоты моделей и прокси хранятся на каждого провайдера, "
+    "каталоги GET /models (CommandCode с фильтром по нативным форматам), reasoning-параметр только через "
+    "OpenRouter; чат, Секретарь, smart-инструменты и Deep Audit идут через активного провайдера; "
+    "сервисные пайпы (Vision, эмбеддинги, граф, rerank, аудио) остаются на OpenRouter/Groq.\n"
     "2.1.6 - Агент научился генерировать и обрабатывать Word-документы (.docx) и оформленные Excel-таблицы (.xlsx) "
     "через execute_python_code (python-docx/docxtpl/openpyxl); большие docx-вложения (>100 тыс. символов) вместо "
     "полного текста дают маркер с путём для программной обработки; текстовые правки промптинга, логика песочницы "
     "не менялась.\n"
-    "2.1.5 - Устойчивость синка/индексации к прерыванию: таймаут 120 с на Vision-вызов, "
-    "постраничный лог и постраничная запись OCR-кэша PDF, инкрементальный file_states.json; "
-    "резолв клика по файлу в чате фоновым потоком (без фриза GUI); ~$ lock-файлы исключены "
-    "из fuzzy-поиска; карта имён inline-иллюстраций в fast-path синка.\n"
-    "2.1.4 - Защита локального кэша XWiki от стирания при частичном сбое синка (пропорциональный "
-    "guard GC); фикс протокола tool-цикла, гонки busy и счётчика шагов агентного цикла; .xls файлы "
-    "теперь индексируются в базе знаний (конверсия через Excel с кэшем).\n"
     "Полная история изменений: docs/DECISIONS.md.\n"
     "\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
@@ -5604,6 +5831,76 @@ def format_xwiki_url_for_ui(raw_url):
         return raw_url
 
 
+# --- Кириллические хоткеи Ctrl+C/X/V/A (русская раскладка, D-2026-10-29-01) ---
+# Проба Tk 8.6.15 (2026-10-29): при русской раскладке Tk отдаёт keysym='??',
+# а кириллицу — в event.char; паттерны <Control-c> не матчатся никогда.
+_CYR_CHAR_TO_LATIN = {
+    "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t", "н": "y",
+    "г": "u", "ш": "i", "щ": "o", "з": "p", "ф": "a", "ы": "s",
+    "в": "d", "а": "f", "п": "g", "р": "h", "о": "j", "л": "k",
+    "д": "l", "я": "z", "ч": "x", "с": "c", "м": "v", "и": "b",
+    "т": "n", "ь": "m",
+}
+_CYR_CTRL_ACTIONS = {"c": "<<Copy>>", "v": "<<Paste>>", "x": "<<Cut>>", "a": "<<SelectAll>>"}
+_LATIN_TO_CYR = {v: k for k, v in _CYR_CHAR_TO_LATIN.items()}
+
+
+def install_cyrillic_shortcuts(root):
+    """Copy/Paste/Cut/SelectAll при русской раскладке + маршруты кастомных хоткеев.
+
+    Один catch-all по модификатору (keysym-деталь не участвует). Сначала EN-гейт:
+    keysym из латинских a..z → события уже обработаны классикой/старыми хоткеями, выход.
+    Иначе латинская кнопка деривируется из event.char (таблица ЙЦУКЕН → control-код
+    → keycode VK 65..90 при пустом char) — и либо генерируется стандартное виртуальное
+    событие Tk, либо берётся маршрут из root._cyr_accel_routes (ключ — кириллический
+    char или его латинский двойник)."""
+    if getattr(root, "_cyr_dispatch", None) is not None:
+        return  # повторный вызов не плодит дублей-обработчиков
+    root._cyr_accel_routes = {}
+
+    def _dispatch(event, is_release=False):
+        try:
+            ks = (getattr(event, "keysym", "") or "").lower()
+            if len(ks) == 1 and "a" <= ks <= "z":
+                return None  # EN-нажатие: классика/EN-хоткеи уже сработали, не дублируем
+            ch = (getattr(event, "char", "") or "").lower()
+            latin = _CYR_CHAR_TO_LATIN.get(ch)
+            if latin is None and ch and len(ch) == 1 and 1 <= ord(ch) <= 26:
+                latin = chr(ord(ch) + 96)  # control-код от Ctrl: '\x03' → 'c'
+            if latin is None:
+                kc = getattr(event, "keycode", 0) or 0
+                if 65 <= kc <= 90:
+                    latin = chr(kc).lower()  # мир D (char=''): VK физической буквы
+            if latin is None:
+                return None
+            routes = getattr(root, "_cyr_accel_routes", None) or {}
+            route = routes.get(ch) or routes.get(_LATIN_TO_CYR.get(latin, ""))
+            if is_release:
+                fn = route.get("release") if route else None
+                if fn:
+                    fn(event)
+                return None
+            if route and route.get("press"):
+                route["press"](event)
+                return "break"
+            virt = _CYR_CTRL_ACTIONS.get(latin)
+            if virt and getattr(event, "widget", None):
+                event.widget.event_generate(virt)
+                return "break"
+            return None
+        except Exception as e:
+            try:
+                log_core.warning("Кириллический хоткей: сбой dispatch: %s", e)
+            except Exception:
+                pass
+            return None
+
+    root._cyr_dispatch = _dispatch
+    root.bind_all("<Control-KeyPress>", _dispatch, add="+")
+    root.bind_all("<Control-KeyRelease>", lambda e: _dispatch(e, is_release=True), add="+")
+    log_core.info("Кириллические биндинги Ctrl+C/X/V/A установлены (маршрут по event.char/keycode)")
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -5649,8 +5946,15 @@ class App(ctk.CTk):
         self.free_models_list = ["stepfun/step-3.5-flash:free", "google/gemini-2.0-flash-exp:free"]
         self.model_reasoning_map = {}  # Карта reasoning-возможностей моделей (id -> {efforts, mandatory, default})
         self.top_models_list = []  # ТОП-10 популярных моделей (Data API rankings-daily)
+        self.provider_catalogs = {}  # v2.2.0: провайдер -> список ID каталога GET /models
+        self.provider_unavailable = {}  # v2.2.0: провайдер -> число моделей нативных форматов (CommandCode)
+        self.provider_free_by_price = {}  # v2.2.0: провайдер -> set ID с нулевой ценой (детектор гостевого каталога)
         threading.Thread(target=self.fetch_free_models, daemon=True).start()
         threading.Thread(target=self.fetch_top_models, daemon=True).start()
+        # Каталоги подписных провайдеров — на старте (данные для гостевого guard'а бесплатных
+        # моделей и для выбора провайдера гостем; OpenRouter обновляется fetch_free_models выше)
+        for _pid in ("OpenCode Go", "CommandCode"):
+            threading.Thread(target=self.fetch_provider_models_list, args=(_pid,), daemon=True).start()
         
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
@@ -5846,6 +6150,8 @@ class App(ctk.CTk):
         if getattr(self, "current_role", "guest") != "admin":
             self.record_btn.grid_remove()
 
+        # Кириллические дубли Ctrl+C/X/V/A при русской раскладке (D-2026-10-29-01)
+        install_cyrillic_shortcuts(self)
         # Применяем горячие клавиши для аудио
         self.apply_audio_hotkey()
 
@@ -5872,7 +6178,12 @@ class App(ctk.CTk):
                 _proxy_info = f"{_ls.get('proxy_host', '127.0.0.1')}:{_ls.get('proxy_port', '2080')}"
             log_core.info("Старт приложения: версия=%s, роль=%s", APP_VERSION, self.current_role)
             log_core.info("Прокси: use_proxy=%s (%s)", _ls.get("use_proxy", False), _proxy_info)
-            log_core.info("Модели: guest=%s, admin=%s, vision=%s, secretary=%s, embedding=%s, graph_rag=%s (enabled=%s)",
+            # Основная чат-модель: провайдер + слоты admin/guest активного провайдера (v2.2.0)
+            _chat_provider = _get_active_llm_provider(getattr(self, "current_role", "guest"))
+            _chat_admin = _get_chat_model_for_role(self, role="admin")
+            _chat_guest = _get_chat_model_for_role(self, role="guest")
+            log_core.info("Модели: provider=%s, chat(admin)=%s, chat(guest)=%s, guest=%s, admin=%s, vision=%s, secretary=%s, embedding=%s, graph_rag=%s (enabled=%s)",
+                          _chat_provider, _chat_admin[1], _chat_guest[1],
                           _ls.get("guest_model", ""), _ls.get("admin_model", ""),
                           self.global_settings.get("vision_model", ""),
                           self.global_settings.get("secretary_model", ""),
@@ -6394,6 +6705,86 @@ class App(ctk.CTk):
             self.top_models_list = list(self.current_settings.get("model_history", []))[:10]
             log_core.info("ТОП-10 моделей: fallback на model_history (%d позиций)", len(self.top_models_list))
 
+    def fetch_provider_models_list(self, provider_id):
+        """Каталог моделей НЕ-OpenRouter провайдера (v2.2.0): GET {base_url}/models.
+        Фильтр (решение 6 плана): CommandCode — жёсткий отбор по supported_endpoints
+        ('/chat/completions' in endpoint); пустой результат фильтра → показываем ВСЕ модели + warning.
+        OpenCode Go метаданных форматов не отдаёт — показываем всех (счётчик недоступных невозможен).
+        Кэш provider_models_cache_{slug}.json; при сбое сети — последний кэш. Прокси — per-провайдера."""
+        slug = re.sub(r"[^a-z0-9]+", "_", str(provider_id).lower()).strip("_") or "provider"
+        try:
+            reg = _LLM_PROVIDERS.get(provider_id)
+            if not reg or provider_id == "OpenRouter":
+                return
+            local = load_local_settings()
+            base_url = reg["base_url"]
+            if provider_id == "Custom":
+                base_url = str(local.get("custom_llm_base_url") or "").strip()
+                if not base_url:
+                    log_core.warning("Каталог моделей Custom: Base URL не задан — фетч пропущен")
+                    self.provider_catalogs.pop(provider_id, None)
+                    self.provider_unavailable.pop(provider_id, None)
+                    return
+            api_key = get_vault_data().get(reg["key_field"], "").strip() or os.getenv(reg["env_var"], "").strip()
+            pap = local.get("provider_use_proxy")
+            use_proxy = bool(pap.get(provider_id, reg["use_proxy_default"])) if isinstance(pap, dict) else bool(reg["use_proxy_default"])
+            proxy_url = None
+            if use_proxy:
+                proxy_url = f"socks5h://{local.get('proxy_host', '127.0.0.1')}:{local.get('proxy_port', '2080')}"
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+            headers = {"Accept": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            t0 = time.time()
+            resp = requests.get(f"{base_url.rstrip('/')}/models", headers=headers, proxies=proxies, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            models = data.get("data", []) if isinstance(data, dict) else []
+            models = models if isinstance(models, list) else []
+
+            available, unavailable, _fallback = _filter_provider_models_catalog(provider_id, models)
+            if _fallback:
+                # Фолбэк решения 6: фильтр пуст — показаны ВСЕ модели (счётчик недоступных = 0)
+                log_core.warning("Каталог CommandCode: фильтр по supported_endpoints не дал моделей (%d шт.) — показаны все", len(models))
+
+            # Детектор бесплатных моделей по цене (идея пользователя 2026-10-28):
+            # провайдер может отдавать в /models цены вывода/входа — нулевая цена = free
+            free_by_price = set()
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                mid = str(model.get("id") or "").strip()
+                if mid and _model_is_free_by_price(model):
+                    free_by_price.add(mid)
+
+            if not available:
+                raise ValueError("API вернул пустой список моделей")
+            sorted_list = sorted(set(available))
+            self.provider_catalogs[provider_id] = sorted_list
+            self.provider_unavailable[provider_id] = unavailable if provider_id == "CommandCode" else None
+            self.provider_free_by_price[provider_id] = sorted(free_by_price & set(sorted_list))
+            _write_json_cache(f"provider_models_cache_{slug}.json",
+                              {"fetched_at": datetime.now().isoformat(), "models": sorted_list,
+                               "unavailable": self.provider_unavailable.get(provider_id),
+                               "free": self.provider_free_by_price.get(provider_id, [])})
+            log_core.info("Каталог моделей %s: загружено %d моделей, недоступных в v1: %s (%.2f с)",
+                          provider_id, len(sorted_list), self.provider_unavailable.get(provider_id),
+                          time.time() - t0)
+        except Exception as e:
+            log_core.warning("Загрузка каталога моделей %s не удалась (%s): %s — использую кэш",
+                             provider_id, _classify_net_error(e), e)
+            cached = _read_json_cache(f"provider_models_cache_{slug}.json")
+            models = cached.get("models") if isinstance(cached, dict) else None
+            if models:
+                self.provider_catalogs[provider_id] = sorted(set(models))
+                if provider_id == "CommandCode":
+                    self.provider_unavailable[provider_id] = cached.get("unavailable") or 0
+                cached_free = cached.get("free")
+                if isinstance(cached_free, list):
+                    self.provider_free_by_price[provider_id] = sorted(set(cached_free))
+                log_core.info("Каталог моделей %s: взяты из кэша (%d позиций, от %s)",
+                              provider_id, len(self.provider_catalogs[provider_id]), cached.get("fetched_at", "?"))
+
     # ==================== ПРОМПТ-МАСТЕР ====================
 
     def load_prompt_templates(self) -> dict:
@@ -6698,6 +7089,7 @@ class App(ctk.CTk):
                         self.unbind(old_release)
                     except Exception:
                         pass
+                self._clear_cyr_accel_route()
         # Управление тумблером автономного чтения
         if hasattr(self, "auto_read_switch"):
             if is_admin:
@@ -6841,6 +7233,7 @@ class App(ctk.CTk):
     def apply_audio_hotkey(self):
         """Привязка динамических горячих клавиш для записи аудио."""
         if getattr(self, "current_role", "guest") != "admin":
+            self._clear_cyr_accel_route()
             return
 
         old_hotkey = getattr(self, "current_audio_hotkey", None)
@@ -6854,6 +7247,7 @@ class App(ctk.CTk):
 
         new_hotkey = self.global_settings.get("audio_hotkey", "<Control-g>")
         self.current_audio_hotkey = new_hotkey
+        self._set_cyr_accel_route(new_hotkey)
 
         try:
             self.bind(new_hotkey, self._on_record_start)
@@ -6861,6 +7255,29 @@ class App(ctk.CTk):
             self.bind(release_key, self._on_record_stop)
         except Exception as e:
             print(f"Ошибка привязки горячих клавиш аудио: {e}")
+
+    def _set_cyr_accel_route(self, pattern):
+        """Кириллический дубль аудио-хоткея (русская раскладка, D-2026-10-29-01).
+
+        Физическое нажатие даёт event.char кириллицей (keysym='??'), поэтому хоткей
+        маршрутизируется через install_cyrillic_shortcuts; поддерживается
+        "<Control-<латинская буква>>" (+Shift)."""
+        routes = getattr(self, "_cyr_accel_routes", None)
+        if routes is None:
+            return
+        routes.clear()
+        m = re.match(r"^<Control-(Shift-)?([a-zA-Z])>$", pattern or "")
+        if not m:
+            return
+        cyr = _LATIN_TO_CYR.get(m.group(2).lower())
+        if not cyr:
+            return
+        routes[cyr] = {"press": self._on_record_start, "release": self._on_record_stop}
+
+    def _clear_cyr_accel_route(self):
+        routes = getattr(self, "_cyr_accel_routes", None)
+        if routes:
+            routes.clear()
 
     def _on_record_start(self, event=None):
         """Начало записи аудио."""
@@ -7789,8 +8206,9 @@ class App(ctk.CTk):
 
     def generate_session_title_background(self, first_prompt):
         try:
-            secretary_model = self.global_settings.get("secretary_model", "openai/gpt-4o-mini") or "openai/gpt-4o-mini"
-            response = get_llm_client().chat.completions.create(
+            # v2.2.0: Фоновый Секретарь идёт через активный чат-провайдер (слот secretary + легаси-фолбэк)
+            _sec_provider, secretary_model = _get_chat_model_for_role(self, role="secretary")
+            response = get_chat_llm_client(role=self.current_role).chat.completions.create(
                 model=secretary_model,
                 messages=[
                     {
@@ -8018,9 +8436,10 @@ class App(ctk.CTk):
             # Выключатель секретаря: снятый чекбокс полностью отключает фоновую работу
             if not self.current_settings.get("secretary_enabled", True):
                 return
-            model = (self.global_settings.get("secretary_model") or "").strip()
+            # v2.2.0: Фоновый Секретарь идёт через активный чат-провайдер (слот secretary + легаси-фолбэк)
+            _sec_provider, model = _get_chat_model_for_role(self, role="secretary")
             if not model:
-                log_llm.warning("Фоновый секретарь: модель не задана — пропуск (укажите модель или снимите чекбокс)")
+                log_llm.warning("Фоновый секретарь: модель не задана (провайдер «%s») — пропуск (укажите модель или снимите чекбокс)", _sec_provider)
                 return
 
             # Формируем контекст из последних сообщений
@@ -8033,7 +8452,7 @@ class App(ctk.CTk):
             )
             
             t0 = time.time()
-            response = get_llm_client().chat.completions.create(
+            response = get_chat_llm_client(role=self.current_role).chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -8267,7 +8686,7 @@ class App(ctk.CTk):
     def open_settings(self):
         settings_window = ctk.CTkToplevel(self)
         settings_window.title("Настройки Агента СМК")
-        settings_window.geometry("850x900")
+        settings_window.geometry("980x920")
         settings_window.transient(self)
         settings_window.grab_set()
 
@@ -8277,24 +8696,24 @@ class App(ctk.CTk):
         tab_models = tabview.add("Модели")
         tab_excludes = tabview.add("Исключения")
         tab_folders = tabview.add("Папки")
-        tab_about = tabview.add("О программе ℹ️")
-        
+        tab_about = tabview.add("О прогр. ℹ️")
+
         # Флаг для удобного разделения прав
         is_admin = (self.current_role == "admin")
         tab_security = tabview.add("Безопасность 🔒") if is_admin else None
-        
+
         # --- ВКЛАДКА: АУДИО И СЕТЬ (ТОЛЬКО ДЛЯ АДМИНА) ---
-        tab_audio_net = tabview.add("Аудио и Сеть") if is_admin else None
+        tab_audio_net = tabview.add("Аудио/Сеть") if is_admin else None
 
         # --- ВКЛАДКА: XWIKI (ВИДИМА ДЛЯ ВСЕХ) ---
         tab_xwiki = tabview.add("XWiki 🌐")
 
-        tab_excel = tabview.add("Настройки Excel 📊")
+        tab_excel = tabview.add("Excel 📊")
 
         # --- ВКЛАДКА: RERANK (ADVANCED RAG, ТОЛЬКО ДЛЯ АДМИНА) ---
-        tab_rerank = tabview.add("Rerank (Advanced RAG)") if is_admin else None
+        tab_rerank = tabview.add("Rerank") if is_admin else None
         # --- ВКЛАДКА: ГРАФЫ (GRAPHRAG, ТОЛЬКО ДЛЯ АДМИНА) ---
-        tab_graph = tabview.add("Графы (GraphRAG) 🕸️") if is_admin else None
+        tab_graph = tabview.add("Графы 🕸️") if is_admin else None
         if is_admin and tab_rerank is not None:
             # Обновляем расшифрованный ключ Cohere из Vault на случай изменения
             self.cohere_api_key_decrypted = get_vault_data().get("cohere_key", "")
@@ -8502,28 +8921,246 @@ class App(ctk.CTk):
             graph_repair_files_slider.configure(command=lambda v: graph_repair_files_label.configure(text=f"{int(v)} файлов"))
 
         # --- ВКЛАДКА 1: МОДЕЛИ ---
-        ctk.CTkLabel(tab_models, text="ID Модели (OpenRouter):").pack(pady=(10, 0))
-
-        # Валидация гостевой модели: если сохранённой нет в свежем списке бесплатных — сброс на первую
+        # --- ПРОВАЙДЕР ОСНОВНОЙ ЧАТ-МОДЕЛИ (v2.2.0; сервисные пайпы не трогаются).
+        # --- С 2026-10-29 выбор по роли: роль_llm_provider (гости тоже выбирают провайдера) ---
+        _PROVIDER_UI_TO_ID = {"OpenRouter": "OpenRouter", "OpenCode Go": "OpenCode Go",
+                              "CommandCode": "CommandCode", "Другой…": "Custom"}
+        _PROVIDER_ID_TO_UI = {v: k for k, v in _PROVIDER_UI_TO_ID.items()}
+        _session_role = "admin" if is_admin else "guest"
+        # Гостю «Другой…» не показываем: Base URL Custom — админская настройка
+        _allowed_pids = list(_PROVIDER_UI_TO_ID.values())
         if not is_admin:
-            saved_guest_model = self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free")
-            if saved_guest_model and saved_guest_model not in self.free_models_list and self.free_models_list:
-                log_core.warning("Гостевая модель '%s' отсутствует в списке бесплатных — сброс на '%s'",
-                                 saved_guest_model, self.free_models_list[0])
-                self.current_settings["guest_model"] = self.free_models_list[0]
+            _allowed_pids = [pid for pid in _allowed_pids if pid != "Custom"]
+        _role_rlp = self.current_settings.get("role_llm_provider")
+        _draft_provider = str(_role_rlp.get(_session_role) or "").strip() if isinstance(_role_rlp, dict) else ""
+        if _draft_provider not in _allowed_pids:
+            _draft_provider = self.current_settings.get("llm_provider", "OpenRouter")
+        if _draft_provider not in _allowed_pids:
+            _draft_provider = "OpenRouter"
+
+        def _slot_value_for(pid, role):
+            """Слот-модель провайдера из снимка настроек (пустой слот → "")."""
+            slots = self.current_settings.get("provider_llm_models")
+            ps = slots.get(pid) if isinstance(slots, dict) else None
+            if isinstance(ps, dict) and (ps.get(role) or "").strip():
+                return str(ps.get(role)).strip()
+            return ""
+
+        def _initial_slot_value(pid, role):
+            """Начальное значение виджета = то, что реально резолвит helper: слот, а при пустом слоте —
+            легаси-фолбэк (admin_model/guest_model/auditor_model; secretary — global secretary_model)."""
+            slot = _slot_value_for(pid, role)
+            if slot:
+                return slot
+            if role == "admin":
+                return self.current_settings.get("admin_model", "openai/gpt-4o-mini")
+            if role == "guest":
+                return self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free")
+            if role == "auditor":
+                return self.current_settings.get("auditor_model", "")
+            if role == "secretary":
+                return self.global_settings.get("secretary_model", "")
+            return ""
+
+        # Черновики слотов ОКНА (актуальная запись в настройки — только по «Сохранить», решение 11 плана);
+        # в save() переносятся только ИЗМЕНЁННЫЕ в окне черновики (_draft_touched), чтобы легаси-префиллы
+        # нетронутых провайдеров не «заматериализовались» в слоты
+        _draft_slots = {pid: {role: _initial_slot_value(pid, role)
+                              for role in ("admin", "guest", "auditor", "secretary")}
+                        for pid in _LLM_PROVIDERS}
+        _draft_touched = set()  # множество (pid, role)
+
+        provider_row = ctk.CTkFrame(tab_models, fg_color="transparent")
+        provider_row.pack(fill="x", padx=20)
+        ctk.CTkLabel(provider_row, text="Провайдер основной модели:").pack(side="left")
+        ctk.CTkLabel(provider_row, text="(выбор по роли)" if not is_admin else "", text_color="gray").pack(side="left", padx=(4, 0))
+        if is_admin:
+            provider_var = ctk.StringVar(value=_PROVIDER_ID_TO_UI[_draft_provider])
+            provider_menu = ctk.CTkOptionMenu(provider_row, values=list(_PROVIDER_UI_TO_ID.keys()),
+                                              variable=provider_var, width=170)
+        else:
+            # Гость выбирает провайдера сам (решение 2026-10-29): чат — только бесплатные модели,
+            # ключи берутся из Vault (заполняет админ на этой машине); «Другой…» недоступен
+            provider_var = ctk.StringVar(value=_PROVIDER_ID_TO_UI[_draft_provider])
+            provider_menu = ctk.CTkOptionMenu(provider_row,
+                                              values=[_PROVIDER_ID_TO_UI[pid] for pid in _allowed_pids],
+                                              variable=provider_var, width=170)
+        provider_menu.pack(side="left", padx=(8, 0))
+
+        # Прокси per-провайдера в ОДНОМ ряду с меню (OpenRouter управляется глобальным
+        # чекбоксом SOCKS5 на вкладке «Аудио/Сеть» — здесь он выключен)
+        provider_proxy_checkbox = ctk.CTkCheckBox(provider_row, text="SOCKS5 Proxy")
+        provider_proxy_checkbox.pack(side="left", padx=(16, 0))
+
+        # Base URL — ТОЛЬКО для «Другой…» (Custom): свой OpenAI-совместимый сервер
+        custom_base_frame = ctk.CTkFrame(tab_models, fg_color="transparent")
+        ctk.CTkLabel(custom_base_frame, text="Custom («Другой…»): Base URL вашего OpenAI-совместимого API (например, http://host:8000/v1):").pack(anchor="w")
+        custom_base_entry = ctk.CTkEntry(custom_base_frame, width=450)
+        custom_base_entry.pack(anchor="w", pady=(2, 0))
+        custom_base_entry.insert(0, str(self.current_settings.get("custom_llm_base_url", "")))
+
+        provider_info_label = ctk.CTkLabel(tab_models, text="Сервисные пайпы (Vision, эмбеддинги, граф, аудио, rerank) остаются на OpenRouter/Groq",
+                                           text_color="gray")
+        provider_info_label.pack(anchor="w", padx=20, pady=(3, 0))
+
+        # Два столбца (паттерн вкладки «Графы»): вкладка не помещалась по высоте.
+        # Слева — основная модель и параметры забега; справа — сервисные модели и аудитор.
+        models_cols = ctk.CTkFrame(tab_models, fg_color="transparent")
+        models_cols.pack(fill="both", expand=True)
+        models_col_left = ctk.CTkFrame(models_cols, fg_color="transparent")
+        models_col_left.pack(side="left", fill="both", expand=True, padx=(5, 2))
+        models_col_right = ctk.CTkFrame(models_cols, fg_color="transparent")
+        models_col_right.pack(side="right", fill="both", expand=True, padx=(2, 5))
+
+        model_label = ctk.CTkLabel(models_col_left, text=f"ID Модели (провайдер: {_draft_provider}):")
+        model_label.pack(pady=(8, 0))
+
+        def _provider_catalog_values(pid):
+            """Merged-список значений комбобокса: ручная история + каталог провайдера
+            (OpenRouter — прежняя логика с ТОП-10)."""
+            manual_now = self.current_settings.get("manual_model_history", []) or []
+            if pid == "OpenRouter":
+                return list(dict.fromkeys(list(manual_now[:5]) +
+                                          [m for m in self.top_models_list if m not in manual_now]))
+            catalog = list(self.provider_catalogs.get(pid) or [])
+            return list(dict.fromkeys(list(manual_now[:5]) + [m for m in catalog if m not in manual_now]))
+
+        def _guest_catalog_values(pid):
+            """Каталог для ГОСТЯ (защита лимита подписки, решение пользователя 2026-10-28):
+            OpenRouter — только бесплатные; подписные (OpenCode Go/CommandCode) — бесплатные
+            модели, определённые ДВУХУРОВНЕВЫМ детектором: (1) нулевая цена в метаданных
+            каталога (_model_is_free_by_price, идея пользователя), (2) суффикс -free/:free в id;
+            Custom — весь каталог (сервер администратора). Если бесплатные не определились —
+            пустой список: гостю остаётся только модель, установленная админом (слот guest)."""
+            if pid == "OpenRouter":
+                return list(self.free_models_list)
+            if pid == "Custom":
+                return _provider_catalog_values(pid)
+            catalog = self.provider_catalogs.get(pid) or []
+            price_free_set = self.provider_free_by_price.get(pid) or set()
+            # Объединение, а не вытеснение: провайдер может отдалять цены лишь части каталога,
+            # остальные бесплатные определяются суффиксом id
+            free = sorted({m for m in catalog
+                           if m in price_free_set or "-free" in m.lower() or ":free" in m.lower()})
+            if free:
+                return free
+            _prov, guest_model = _get_chat_model_for_role(self, role="guest")
+            return [guest_model] if guest_model else []
+
+        def _guest_free_display(pid, value):
+            """Показываемое значение гостя — всегда бесплатная модель каталога (обратная связь
+            2026-10-28: слот гостя содержал платную модель, а dropdown — бесплатные). Слот, не
+            входящий в бесплатные, подменяется первой бесплатной и помечается изменённым —
+            «Сохранить» материализует подмену. Custom не ограничивается; список неизвестен —
+            значение не трогаем (переменная refreshed позже, когда каталог догрузится)."""
+            value = str(value or "").strip()
+            if pid == "Custom" or not value:
+                return value
+            vals = _guest_catalog_values(pid)
+            if vals and value not in vals:
+                fixed = vals[0]
+                log_core.warning("Гостевой слот %s: модель '%s' не входит в бесплатные — подменена на '%s'",
+                                 pid, value, fixed)
+                _draft_slots[pid]["guest"] = fixed
+                _draft_touched.add((pid, "guest"))
+                return fixed
+            return value
+
+
+        def _bind_typeahead(combo, full_getter):
+            """Живой фильтр каталога (по просьбе пользователя): печать в поле сужает список
+            значений до совпадающих подстрок («glm» → только z-ai/glm-…); отфильтрованный список
+            показывается по клику на стрелку. Работает с внутренним tk.Entry комбобокса,
+            фильтрация — с дебаунсом 80 мс. Авто-открытие dropdown из кода не используется:
+            Menu.post сразу после пересборки команд меню зависает на Windows (проверено)."""
+            entry = getattr(combo, "_entry", None)
+            if entry is None:
+                return
+
+            _NAV_KEYS = ("Up", "Down", "Return", "Escape", "Tab", "Left", "Right", "Home", "End",
+                         "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R")
+            _pending = {"after_id": None}
+
+            def _apply_filter():
+                _pending["after_id"] = None
+                try:
+                    if not (settings_window.winfo_exists() and combo.winfo_exists()):
+                        return
+                except Exception:
+                    return
+                txt = combo.get().strip().lower()
+                full = full_getter() or []
+                if not txt:
+                    combo.configure(values=list(full))
+                    return
+                flt = [mid for mid in full if txt in str(mid).lower()]
+                combo.configure(values=flt if flt else list(full))
+
+            def _on_type(event):
+                if str(event.keysym) in _NAV_KEYS:
+                    return
+                if _pending["after_id"] is not None:
+                    try:
+                        combo.after_cancel(_pending["after_id"])
+                    except Exception:
+                        pass
+                _pending["after_id"] = combo.after(80, _apply_filter)
+
+            entry.bind("<KeyRelease>", _on_type)
 
         if is_admin:
-            # АДМИН: ручной ввод + список (5 ручных + ТОП-10 популярных, дедупликация)
-            manual_history = self.current_settings.get("manual_model_history", []) or []
-            admin_values = list(dict.fromkeys(list(manual_history[:5]) +
-                                              [m for m in self.top_models_list if m not in manual_history]))
-            model_entry = ctk.CTkComboBox(tab_models, width=450, values=admin_values)
-            model_entry.set(self.current_settings.get("admin_model", "openai/gpt-4o-mini"))
+            # АДМИН: ручной ввод + merged-каталог активного провайдера
+            model_entry = ctk.CTkComboBox(models_col_left, width=430, values=_provider_catalog_values(_draft_provider))
+            model_entry.set(_draft_slots[_draft_provider]["admin"])
         else:
-            # ГОСТЬ: Только чтение, список бесплатных моделей
-            model_entry = ctk.CTkComboBox(tab_models, width=450, values=self.free_models_list, state="readonly")
-            model_entry.set(self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free"))
+            # ГОСТЬ: readonly-каталог активного провайдера
+            if _draft_provider == "OpenRouter":
+                model_entry = ctk.CTkComboBox(models_col_left, width=430, values=self.free_models_list, state="readonly")
+            else:
+                _g_vals = _guest_catalog_values(_draft_provider)
+                model_entry = ctk.CTkComboBox(models_col_left, width=430,
+                                              values=(_g_vals or ["Загрузка..."]), state="readonly")
+            model_entry.set(_guest_free_display(_draft_provider, _draft_slots[_draft_provider]["guest"]))
         model_entry.pack(pady=5)
+        if is_admin:
+            # Живой фильтр каталога при наборе (v2.2.0, обратная связь пользователя)
+            _bind_typeahead(model_entry, lambda: _provider_catalog_values(_draft_provider))
+
+        # Подсказка/счётчик под комбобоксом модели (решение 6 плана)
+        provider_models_hint_label = ctk.CTkLabel(models_col_left, text="", text_color="gray", wraplength=400, justify="left")
+        provider_models_hint_label.pack(anchor="w", padx=10)
+
+        def _update_provider_models_hint():
+            try:
+                if not (settings_window.winfo_exists() and provider_models_hint_label.winfo_exists()):
+                    return
+                pid = _draft_provider
+                parts = []
+                if not is_admin:
+                    # Гость: OpenRouter — только бесплатные; подписные — только -free-модели
+                    # (платные жгут лимит подписки); Custom — весь каталог (сервер админа)
+                    if pid == "OpenRouter":
+                        parts.append("Гостю доступны только бесплатные модели OpenRouter")
+                    elif pid == "Custom":
+                        parts.append("Гостю доступны все модели (сервер администратора)")
+                    else:
+                        full_cat = self.provider_catalogs.get(pid) or []
+                        guest_cat = _guest_catalog_values(pid)
+                        if guest_cat and (not full_cat or len(guest_cat) < len(full_cat)):
+                            parts.append(f"Гостю доступны только бесплатные модели ({len(guest_cat)} шт.) — платные жгут лимит подписки")
+                        else:
+                            parts.append("Бесплатные модели не определены — гость ограничен моделью, установленной админом")
+                if pid == "OpenCode Go":
+                    parts.append("Работают модели: glm*, kimi*, deepseek*, longcat*, step*, mimo*, hy3/hy4")
+                if pid == "CommandCode":
+                    catalog = self.provider_catalogs.get(pid)
+                    if isinstance(catalog, list) and catalog:
+                        unavailable = self.provider_unavailable.get(pid) or 0
+                        if unavailable:
+                            parts.append(f"{unavailable} моделей провайдера недоступны агенту — нужен другой формат API")
+                provider_models_hint_label.configure(text="\n".join(parts))
+            except Exception:
+                pass
 
         # --- Фоновое обновление списков моделей (прокси+ключ; UI — строго через after) ---
         def _refresh_model_comboboxes():
@@ -8532,21 +9169,30 @@ class App(ctk.CTk):
                     return
                 current_value = model_entry.get()
                 if is_admin:
-                    manual_now = self.current_settings.get("manual_model_history", []) or []
-                    new_values = list(dict.fromkeys(list(manual_now[:5]) +
-                                                    [m for m in self.top_models_list if m not in manual_now]))
+                    new_values = _provider_catalog_values(_draft_provider)
                     if new_values:
                         model_entry.configure(values=new_values)
                         # Не сбрасываем текущее значение; если его нет в новом списке — добавляем
                         if current_value and current_value not in new_values:
                             model_entry.configure(values=[current_value] + new_values)
                 else:
-                    if self.free_models_list:
-                        model_entry.configure(values=self.free_models_list)
-                        if current_value and current_value not in self.free_models_list:
-                            # Гость: значение не из списка бесплатных — сбрасываем на первую
-                            log_core.warning("Гостевая модель '%s' не входит в обновлённый список бесплатных — сброс", current_value)
-                            model_entry.set(self.free_models_list[0])
+                    if _draft_provider == "OpenRouter":
+                        if self.free_models_list:
+                            model_entry.configure(values=self.free_models_list)
+                            if current_value and current_value not in self.free_models_list:
+                                # Гость: значение не из списка бесплатных — сбрасываем на первую
+                                log_core.warning("Гостевая модель '%s' не входит в обновлённый список бесплатных — сброс", current_value)
+                                model_entry.set(self.free_models_list[0])
+                    else:
+                        # Подписные провайдеры: каталог догрузился — платно-безопасное значение гостя
+                        catalog_now = _guest_catalog_values(_draft_provider)
+                        if catalog_now:
+                            model_entry.configure(values=catalog_now)
+                            fixed_now = _guest_free_display(_draft_provider, model_entry.get().strip())
+                            if fixed_now != model_entry.get().strip():
+                                model_entry.set(fixed_now)
+                # Подсказка/счётчик нативных моделей активного провайдера (v2.2.0)
+                _update_provider_models_hint()
                 # Синхронно обновляем комбобокс GraphRAG-модели (использует free_models_list)
                 if is_admin and getattr(self, "graph_rag_model_combo", None) is not None:
                     try:
@@ -8568,6 +9214,9 @@ class App(ctk.CTk):
 
         threading.Thread(target=self.fetch_free_models, daemon=True).start()
         threading.Thread(target=self.fetch_top_models, daemon=True).start()
+        # Каталог не-OpenRouter провайдера — параллельно с фетчами OpenRouter (v2.2.0)
+        if _draft_provider != "OpenRouter":
+            threading.Thread(target=self.fetch_provider_models_list, args=(_draft_provider,), daemon=True).start()
 
         def _fetch_and_refresh_models():
             # Оба фетча уже запущены выше параллельно; ждём немного и обновляем UI в главном потоке
@@ -8582,16 +9231,18 @@ class App(ctk.CTk):
         threading.Thread(target=_fetch_and_refresh_models_slow, daemon=True).start()
 
         # --- ГЛОБАЛЬНАЯ ТЕМПЕРАТУРА И РАССУЖДЕНИЯ ---
-        ctk.CTkLabel(tab_models, text="Базовая Температура (креативность):", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 0))
-        api_temp_slider = ctk.CTkSlider(tab_models, from_=0.0, to=2.0, number_of_steps=20, variable=self.api_temp_var, width=300)
+        ctk.CTkLabel(models_col_left, text="Базовая Температура (креативность):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0))
+        api_temp_slider = ctk.CTkSlider(models_col_left, from_=0.0, to=2.0, number_of_steps=20, variable=self.api_temp_var, width=290)
         api_temp_slider.pack(pady=(5, 0))
-        api_temp_label = ctk.CTkLabel(tab_models, text=f"{self.api_temp_var.get():.1f}")
+        api_temp_label = ctk.CTkLabel(models_col_left, text=f"{self.api_temp_var.get():.1f}")
         api_temp_label.pack(pady=(0, 5))
         api_temp_slider.configure(command=lambda v: api_temp_label.configure(text=f"{v:.1f}"))
 
-        ctk.CTkLabel(tab_models, text="Степень размышления (Reasoning Effort):", font=ctk.CTkFont(weight="bold")).pack(pady=(5, 0))
-        api_reasoning_combo = ctk.CTkComboBox(tab_models, values=["Отключено"], width=200, variable=self.api_reasoning_var)
-        api_reasoning_combo.pack(pady=(5, 10))
+        ctk.CTkLabel(models_col_left, text="Степень размышления (Reasoning Effort):", font=ctk.CTkFont(weight="bold")).pack(pady=(5, 0))
+        api_reasoning_combo = ctk.CTkComboBox(models_col_left, values=["Отключено"], width=200, variable=self.api_reasoning_var)
+        api_reasoning_combo.pack(pady=(5, 0))
+        reasoning_hint_label = ctk.CTkLabel(models_col_left, text="", text_color="gray", wraplength=380)
+        reasoning_hint_label.pack(pady=(0, 10))
 
         _ALL_EFFORTS = ["Отключено", "low", "medium", "high", "max"]
 
@@ -8600,6 +9251,14 @@ class App(ctk.CTk):
             Модель без объекта reasoning в карте (не-reasoning или неизвестный ID) — только «Отключено»."""
             if not (settings_window.winfo_exists() and api_reasoning_combo.winfo_exists()):
                 return
+            # Гейт провайдера (v2.2.0): reasoning-параметр (extra_body) шлётся только через OpenRouter
+            if _draft_provider != "OpenRouter":
+                api_reasoning_combo.configure(values=["Отключено"])
+                if self.api_reasoning_var.get() != "Отключено":
+                    self.api_reasoning_var.set("Отключено")
+                reasoning_hint_label.configure(text="reasoning-параметр шлётся только через OpenRouter — при этом провайдере отключён")
+                return
+            reasoning_hint_label.configure(text="")
             selected_model = model_entry.get().strip()
             # Пустая карта (оффлайн/первые секунды/сбой загрузки): не трогаем комбо и
             # уровень reasoning — иначе сохранение персистирует понижение (#7, D-2026-09-28)
@@ -8623,27 +9282,27 @@ class App(ctk.CTk):
         model_entry.configure(command=lambda _choice: _update_reasoning_combo())
         _update_reasoning_combo()
 
-        ctk.CTkLabel(tab_models, text="Макс. шагов цикла поиска/размышления (Excel — отдельный лимит):", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 0))
-        agent_steps_slider = ctk.CTkSlider(tab_models, from_=5, to=60, number_of_steps=55, variable=self.agent_max_steps_var, width=300)
+        ctk.CTkLabel(models_col_left, text="Макс. шагов цикла поиска/размышления (Excel — отдельный лимит):", font=ctk.CTkFont(weight="bold"), wraplength=400).pack(pady=(10, 0))
+        agent_steps_slider = ctk.CTkSlider(models_col_left, from_=5, to=60, number_of_steps=55, variable=self.agent_max_steps_var, width=290)
         agent_steps_slider.pack(pady=(5, 0))
-        agent_steps_label = ctk.CTkLabel(tab_models, text=f"{int(self.agent_max_steps_var.get())}")
+        agent_steps_label = ctk.CTkLabel(models_col_left, text=f"{int(self.agent_max_steps_var.get())}")
         agent_steps_label.pack(pady=(0, 5))
         agent_steps_slider.configure(command=lambda v: agent_steps_label.configure(text=f"{int(float(v))}"))
 
-        ctk.CTkLabel(tab_models, text="Модель для Vision (OCR сканов и схем):").pack(pady=(10, 0))
-        vision_entry = ctk.CTkEntry(tab_models, width=450)
+        ctk.CTkLabel(models_col_right, text="Модель для Vision (OCR сканов и схем):").pack(pady=(15, 0))
+        vision_entry = ctk.CTkEntry(models_col_right, width=420)
         vision_entry.pack(pady=5)
         vision_entry.insert(0, self.global_settings.get("vision_model", "openai/gpt-4o-mini"))
         if not is_admin: vision_entry.configure(state="disabled", text_color="gray")
 
-        ctk.CTkLabel(tab_models, text="Модель Фонового Секретаря:").pack(pady=(10, 0))
-        secretary_entry = ctk.CTkEntry(tab_models, width=450)
+        ctk.CTkLabel(models_col_right, text=f"Модель Фонового Секретаря (провайдер: {_draft_provider}):").pack(pady=(10, 0))
+        secretary_entry = ctk.CTkEntry(models_col_right, width=420)
         secretary_entry.pack(pady=5)
-        secretary_entry.insert(0, self.global_settings.get("secretary_model", "openai/gpt-4o-mini"))
+        secretary_entry.insert(0, _draft_slots[_draft_provider]["secretary"])
         if not is_admin: secretary_entry.configure(state="disabled", text_color="gray")
 
         secretary_checkbox = ctk.CTkCheckBox(
-            tab_models,
+            models_col_right,
             text="Фоновый Секретарь: запоминать новые факты СМК",
             variable=self.secretary_enabled_var
         )
@@ -8651,29 +9310,31 @@ class App(ctk.CTk):
         if not is_admin:
             secretary_checkbox.configure(state="disabled", text_color="gray")
 
-        ctk.CTkLabel(tab_models, text="Модель Эмбеддингов (нужен перезапуск):").pack(pady=(10, 0))
-        embed_entry = ctk.CTkEntry(tab_models, width=450)
+        ctk.CTkLabel(models_col_right, text="Модель Эмбеддингов (нужен перезапуск):").pack(pady=(10, 0))
+        embed_entry = ctk.CTkEntry(models_col_right, width=420)
         embed_entry.pack(pady=5)
         embed_entry.insert(0, self.global_settings.get("embedding_model", "qwen/qwen3-embedding-8b"))
         if not is_admin: embed_entry.configure(state="disabled", text_color="gray")
 
         # --- БЛОК НАСТРОЕК АУДИТОРА (Глубокий аудит / Рефлексия) ---
-        ctk.CTkLabel(tab_models, text="").pack()  # Разделитель
-        audit_separator = ctk.CTkFrame(tab_models, height=2, fg_color="#3a3a3a")
-        audit_separator.pack(fill="x", padx=20, pady=5)
-        ctk.CTkLabel(tab_models, text="🕵️‍♂️ Модель-Аудитор (Глубокий аудит):", font=ctk.CTkFont(weight="bold")).pack(pady=(5, 0))
+        audit_separator = ctk.CTkFrame(models_col_right, height=2, fg_color="#3a3a3a")
+        audit_separator.pack(fill="x", padx=10, pady=(15, 5))
+        ctk.CTkLabel(models_col_right, text="🕵️‍♂️ Модель-Аудитор (Глубокий аудит):", font=ctk.CTkFont(weight="bold")).pack(pady=(5, 0))
 
-        use_main_model_checkbox = ctk.CTkCheckBox(tab_models, text="Использовать основную модель для аудита")
-        use_main_model_checkbox.pack(pady=(5, 0), anchor="w", padx=50)
+        use_main_model_checkbox = ctk.CTkCheckBox(models_col_right, text="Использовать основную модель для аудита")
+        use_main_model_checkbox.pack(pady=(5, 0), anchor="w", padx=10)
         if self.current_settings.get("use_main_model_for_audit", True):
             use_main_model_checkbox.select()
         else:
             use_main_model_checkbox.deselect()
 
+        # Auditor-combo: merged values по каталогу активного провайдера (аналогично основной модели)
         history = self.current_settings.get("model_history", [])
-        auditor_model_combobox = ctk.CTkComboBox(tab_models, width=450, values=history)
-        auditor_model_combobox.set(self.current_settings.get("auditor_model", ""))
+        auditor_model_combobox = ctk.CTkComboBox(models_col_right, width=420, values=_provider_catalog_values(_draft_provider) or history)
+        auditor_model_combobox.set(_draft_slots[_draft_provider]["auditor"])
         auditor_model_combobox.pack(pady=5)
+        if is_admin:
+            _bind_typeahead(auditor_model_combobox, lambda: _provider_catalog_values(_draft_provider))
         # Если чекбокс активен — комбобокс отключен
         if self.current_settings.get("use_main_model_for_audit", True):
             auditor_model_combobox.configure(state="disabled")
@@ -8691,13 +9352,84 @@ class App(ctk.CTk):
         use_main_model_checkbox.configure(command=on_use_main_model_toggle)
         # -----------------------------------------------------------
 
+        # --- ПРИМЕНЕНИЕ СОСТОЯНИЙ И СМЕНА ПРОВАЙДЕРА (v2.2.0) ---
+        def _apply_provider_states(pid):
+            if not (settings_window.winfo_exists() and provider_proxy_checkbox.winfo_exists()):
+                return
+            if pid == "OpenRouter":
+                provider_proxy_checkbox.configure(state="disabled")
+                if bool(self.current_settings.get("use_proxy", False)):
+                    provider_proxy_checkbox.select()
+                else:
+                    provider_proxy_checkbox.deselect()
+            else:
+                provider_proxy_checkbox.configure(state="normal")
+                _pap = self.current_settings.get("provider_use_proxy")
+                _pap = _pap if isinstance(_pap, dict) else {}
+                if bool(_pap.get(pid, False)):
+                    provider_proxy_checkbox.select()
+                else:
+                    provider_proxy_checkbox.deselect()
+            # Поле Base URL видно только у Custom («Другой…») — возвращает своё место при показе
+            if pid == "Custom" and is_admin:
+                custom_base_frame.pack(fill="x", padx=20, before=provider_info_label)
+            else:
+                custom_base_frame.pack_forget()
+            model_label.configure(text=f"ID Модели (провайдер: {pid}):")
+
+        def _on_provider_change(choice):
+            nonlocal _draft_provider
+            _pid = _PROVIDER_UI_TO_ID.get(choice)
+            if not _pid or _pid == _draft_provider or not (settings_window.winfo_exists() and model_entry.winfo_exists()):
+                return
+            # Черновик введённых значений — в слоты СТАРОГО провайдера (в памяти окна, до «Сохранить»)
+            _old_pid = _draft_provider
+            if is_admin:
+                _draft_slots[_old_pid]["admin"] = model_entry.get().strip()
+                _draft_slots[_old_pid]["auditor"] = auditor_model_combobox.get().strip()
+                _draft_slots[_old_pid]["secretary"] = secretary_entry.get().strip()
+                _draft_touched.update({(_old_pid, "admin"), (_old_pid, "auditor"), (_old_pid, "secretary")})
+            else:
+                _draft_slots[_old_pid]["guest"] = _guest_free_display(_old_pid, model_entry.get().strip())
+                _draft_touched.add((_old_pid, "guest"))
+            _draft_provider = _pid
+            if is_admin:
+                model_entry.set(_draft_slots[_pid]["admin"])
+                auditor_model_combobox.set(_draft_slots[_pid]["auditor"])
+                auditor_model_combobox.configure(values=_provider_catalog_values(_pid) or history)
+                secretary_entry.configure(state="normal")
+                secretary_entry.delete(0, "end")
+                secretary_entry.insert(0, _draft_slots[_pid]["secretary"])
+            else:
+                # Гость: сперва каталог, затем платно-безопасное отображаемое значение
+                model_entry.configure(values=(_guest_catalog_values(_pid) or ["Загрузка..."]))
+                model_entry.set(_guest_free_display(_pid, _draft_slots[_pid]["guest"]))
+            # Подстановка UI под нового провайдера
+            _apply_provider_states(_pid)
+            # Каталог нового провайдера (если не загружен) — фоном, без сброса отображаемой модели
+            if _pid != "OpenRouter" and not self.provider_catalogs.get(_pid):
+                threading.Thread(target=self.fetch_provider_models_list, args=(_pid,), daemon=True).start()
+            _update_reasoning_combo()
+            _update_provider_models_hint()
+
+        _apply_provider_states(_draft_provider)
+        provider_menu.configure(command=_on_provider_change)
+        # -----------------------------------------------------------
+
         openrouter_entry = None
         groq_entry = None
         tavily_entry = None
+        opencode_entry = None
+        commandcode_entry = None
+        custom_key_entry = None
         admin_pwd_entry = None
         sync_password_entry = None
         if is_admin and tab_security is not None:
             vault_data = get_vault_data()
+
+            # Прокручиваемая область: 12+ полей ключей/паролей не помещаются в окно целиком
+            tab_security = ctk.CTkScrollableFrame(tab_security, width=880, height=760)
+            tab_security.pack(fill="both", expand=True)
 
             ctk.CTkLabel(tab_security, text="OpenRouter API Key:").pack(pady=(10, 0))
             openrouter_entry = ctk.CTkEntry(tab_security, width=450, show="*")
@@ -8713,6 +9445,22 @@ class App(ctk.CTk):
             tavily_entry = ctk.CTkEntry(tab_security, width=450, show="*")
             tavily_entry.pack(pady=5)
             tavily_entry.insert(0, vault_data.get("tavily_key", ""))
+
+            # Ключи не-OpenRouter провайдеров основной чат-модели (v2.2.0)
+            ctk.CTkLabel(tab_security, text="OpenCode Go API Key (провайдер основной модели):").pack(pady=(10, 0))
+            opencode_entry = ctk.CTkEntry(tab_security, width=450, show="*")
+            opencode_entry.pack(pady=5)
+            opencode_entry.insert(0, vault_data.get("opencode_key", ""))
+
+            ctk.CTkLabel(tab_security, text="CommandCode API Key (провайдер основной модели):").pack(pady=(10, 0))
+            commandcode_entry = ctk.CTkEntry(tab_security, width=450, show="*")
+            commandcode_entry.pack(pady=5)
+            commandcode_entry.insert(0, vault_data.get("commandcode_key", ""))
+
+            ctk.CTkLabel(tab_security, text="Custom: API Key (свой OpenAI-совместимый провайдер):").pack(pady=(10, 0))
+            custom_key_entry = ctk.CTkEntry(tab_security, width=450, show="*")
+            custom_key_entry.pack(pady=5)
+            custom_key_entry.insert(0, vault_data.get("custom_llm_key", ""))
 
             ctk.CTkLabel(tab_security, text="Пароль администратора:").pack(pady=(10, 0))
             admin_pwd_entry = ctk.CTkEntry(tab_security, width=450, show="*")
@@ -8952,13 +9700,55 @@ class App(ctk.CTk):
         # --- СОХРАНЕНИЕ НАСТРОЕК ---
         def save():
             new_model = model_entry.get().strip()
+            # Активный провайдер = выбранное в меню значение (_draft_provider обновляется хендлером смены)
+            sel_provider = _draft_provider
+            # Слоты на провайдера (v2.2.0): активные значения из виджетов + черновики остальных провайдеров
             if is_admin:
-                self.current_settings["admin_model"] = new_model
+                _draft_slots[sel_provider]["admin"] = new_model
+                _draft_slots[sel_provider]["auditor"] = auditor_model_combobox.get().strip()
+                _draft_slots[sel_provider]["secretary"] = secretary_entry.get().strip()
+                # Активный провайдер: значения из виджетов — ВСЕГДА к записи (иначе при сохранении
+                # без переключения провайдера в диалоге модель в слот не попадает — баг №1 отчёта)
+                _draft_touched.update({(sel_provider, "admin"), (sel_provider, "auditor"), (sel_provider, "secretary")})
             else:
-                self.current_settings["guest_model"] = new_model
+                _draft_slots[sel_provider]["guest"] = _guest_free_display(sel_provider, new_model)
+                _draft_touched.add((sel_provider, "guest"))
+            slots_v = self.current_settings.get("provider_llm_models")
+            slots_v = slots_v if isinstance(slots_v, dict) else {}
+            for (t_pid, t_role) in _draft_touched:
+                t_slots = slots_v.get(t_pid) if isinstance(slots_v.get(t_pid), dict) else {}
+                t_slots[t_role] = _draft_slots[t_pid][t_role]
+                slots_v[t_pid] = t_slots
+            self.current_settings["provider_llm_models"] = slots_v
+            # Выбор провайдера по роли (решение 2026-10-29): админ пишет свой ключ и общий
+            # llm_provider (легаси-фолбэк), гость — только свой ключ; выборы не затирают друг друга
+            rlp = self.current_settings.get("role_llm_provider")
+            rlp = rlp if isinstance(rlp, dict) else {}
+            rlp[_session_role] = sel_provider
+            self.current_settings["role_llm_provider"] = rlp
+            if is_admin:
+                self.current_settings["llm_provider"] = sel_provider
+                if sel_provider == "Custom":
+                    self.current_settings["custom_llm_base_url"] = custom_base_entry.get().strip()
+            # Прокси per-провайдера — и админ, и гость (настройка локальная на машину)
+            pap = self.current_settings.get("provider_use_proxy")
+            pap = pap if isinstance(pap, dict) else {}
+            if sel_provider != "OpenRouter":
+                pap[sel_provider] = bool(provider_proxy_checkbox.get())
+                self.current_settings["provider_use_proxy"] = pap
+            # Легаси-дубли — ТОЛЬКО при OpenRouter (чтение всегда через helper, единственный источник — слоты)
+            if sel_provider == "OpenRouter":
+                if is_admin:
+                    self.current_settings["admin_model"] = new_model
+                else:
+                    self.current_settings["guest_model"] = _draft_slots[sel_provider]["guest"]
 
             self.current_settings["api_temperature"] = float(self.api_temp_var.get())
-            self.current_settings["api_reasoning"] = self.api_reasoning_var.get()
+            # Гард reasoning (решение 5 плана): при провайдере != OpenRouter значение api_reasoning
+            # НЕ перезаписывается — иначе сохранение настроек под другим провайдером затрёт уровень
+            # OpenRouter-модели (возвращение на OpenRouter снова применит сохранённое значение).
+            if sel_provider == "OpenRouter":
+                self.current_settings["api_reasoning"] = self.api_reasoning_var.get()
             self.current_settings["agent_max_steps"] = int(self.agent_max_steps_var.get())
 
             if is_admin:
@@ -9018,7 +9808,10 @@ class App(ctk.CTk):
                 
                 # 2. Сохранение остальных системных полей
                 self.global_settings["vision_model"] = vision_entry.get().strip()
-                self.global_settings["secretary_model"] = secretary_entry.get().strip()
+                # Легаси secretary_model — дубль только при OpenRouter (иначе слот секретаря хранится
+                # в provider_llm_models, записан выше); других провайдерах глобальное поле НЕ трогаем
+                if sel_provider == "OpenRouter":
+                    self.global_settings["secretary_model"] = secretary_entry.get().strip()
                 self.global_settings["embedding_model"] = embed_entry.get().strip()
 
                 # Выключатель Фонового Секретаря
@@ -9066,7 +9859,9 @@ class App(ctk.CTk):
 
                 # 2.1 Сохранение настроек Аудитора
                 self.current_settings["use_main_model_for_audit"] = bool(use_main_model_checkbox.get())
-                self.current_settings["auditor_model"] = auditor_model_combobox.get().strip()
+                # Легаси auditor_model — дубль только при OpenRouter (слот auditor записан выше в слоты)
+                if sel_provider == "OpenRouter":
+                    self.current_settings["auditor_model"] = auditor_model_combobox.get().strip()
                 
                 # 3. Сохранение папок и исключений
                 ex_text = excludes_entry.get("1.0", "end-1c")
@@ -9093,6 +9888,9 @@ class App(ctk.CTk):
                     "openrouter_key": openrouter_entry.get().strip() if openrouter_entry else "",
                     "groq_key": groq_entry.get().strip() if groq_entry else "",
                     "tavily_key": tavily_entry.get().strip() if tavily_entry else "",
+                    "opencode_key": opencode_entry.get().strip() if opencode_entry else "",
+                    "commandcode_key": commandcode_entry.get().strip() if commandcode_entry else "",
+                    "custom_llm_key": custom_key_entry.get().strip() if custom_key_entry else "",
                     "admin_password": (admin_pwd_entry.get().strip() if admin_pwd_entry else "admin") or "admin",
                     "sync_password": sync_password_entry.get().strip() if sync_password_entry else "",
                     "xwiki_login": xwiki_login_entry.get().strip() if xwiki_login_entry else "",
@@ -9392,7 +10190,28 @@ class App(ctk.CTk):
                 step("7. LLM-модель GraphRAG", False,
                      f"model={model}, {_classify_net_error(e)}: {_mask_secrets(e)} — проверьте, существует ли ID модели")
 
-            report("\nДиагностика завершена. Сеть/прокси = пункты 2-3; БД = пункты 5-6; модель GraphRAG = пункт 7.")
+            # 8. Основная чат-модель активного провайдера (v2.2.0): 1-токенный проб модели роли
+            try:
+                diag_provider, diag_model = _get_chat_model_for_role(self)
+                diag_role = getattr(self, "current_role", "guest")
+                step_name = f"8. Основная модель (провайдер={diag_provider})"
+                if not diag_model:
+                    step(step_name, False,
+                         f"ID модели для роли «{diag_role}» не задан — заполните слот на вкладке «Модели»")
+                elif diag_provider == "Custom" and not (ls.get("custom_llm_base_url") or "").strip():
+                    step(step_name, False,
+                         "Base URL альтернативного провайдера (Custom) не задан — вкладка «Модели»")
+                else:
+                    t0 = time.time()
+                    get_chat_llm_client(role=self.current_role).chat.completions.create(
+                        model=diag_model, max_tokens=1,
+                        messages=[{"role": "user", "content": "."}], timeout=20)
+                    step(step_name, True, f"model={diag_model} (роль: {diag_role}), {time.time() - t0:.2f} с")
+            except Exception as e:
+                step(f"8. Основная модель (провайдер={diag_provider})", False,
+                     f"model={diag_model}, {_classify_net_error(e)}: {_mask_secrets(e)} — проверьте ID модели и ключ провайдера")
+
+            report("\nДиагностика завершена. Сеть/прокси = пункты 2-3; БД = пункты 5-6; модель GraphRAG = пункт 7; основная модель = пункт 8.")
         except Exception as e:
             log_core.exception("Диагностика: общая ошибка")
             report(f"\n[❌] Диагностика прервана ошибкой: {e}")
@@ -9787,7 +10606,7 @@ class App(ctk.CTk):
         return tools
 
     def run_deep_audit(self, user_query, draft_answer, gathered_context=""):
-        """Выполняет тихую проверку черновика ответа через OpenRouter (модель-аудитор)."""
+        """Выполняет тихую проверку черновика ответа через активного чат-провайдера (модель-аудитор)."""
         import re
 
         # Защищаем служебные ссылки от искажения моделью-аудитором
@@ -9805,26 +10624,26 @@ class App(ctk.CTk):
 
         shielded_draft = re.sub(link_pattern, _shield_link, draft_answer)
 
-        # 1. Выбор модели аудитора по ролям и флажку
+        # 1. Выбор модели аудитора по ролям и флажку (v2.2.0: helper активного чат-провайдера)
         if self.current_role == "guest":
-            # ГОСТЬ: всегда используем ту же модель, что выбрана как основная гостевая.
+            # ГОСТЬ: всегда модель основной чат-модели гостя активного провайдера.
             # Ручной выбор модели аудитора в гостевом режиме заблокирован в UI.
-            audit_model = (self.current_settings.get("guest_model", "") or "").strip()
+            provider_name, audit_model = _get_chat_model_for_role(self, role="guest")
         else:
             # АДМИН:
-            # - если флажок включен -> модель аудитора = основная модель админа;
-            # - если флажок выключен -> модель аудитора = значение из поля auditor_model.
+            # - если флажок включен -> модель аудитора = основная модель админа (слот admin);
+            # - если флажок выключен -> слот auditor (легаси-фолбэк auditor_model) активного провайдера.
             use_main = self.current_settings.get("use_main_model_for_audit", True)
-            admin_main_model = (self.current_settings.get("admin_model", "") or self.current_settings.get("api_model", "")).strip()
-            manual_auditor_model = (self.current_settings.get("auditor_model", "") or "").strip()
-            audit_model = admin_main_model if use_main else manual_auditor_model
-        
-        if not audit_model:
-            # Без хардкода: fallback только на уже выбранную основную модель роли
-            if self.current_role == "admin":
-                audit_model = (self.current_settings.get("admin_model", "") or self.current_settings.get("api_model", "")).strip()
+            if use_main:
+                provider_name, audit_model = _get_chat_model_for_role(self, role="admin")
             else:
-                audit_model = (self.current_settings.get("guest_model", "") or "").strip()
+                provider_name, audit_model = _get_chat_model_for_role(self, role="auditor")
+                if not audit_model:
+                    # Пустой слот аудитора -> основная модель админа (прежнее поведение без хардкода)
+                    provider_name, audit_model = _get_chat_model_for_role(self, role="admin")
+        if not audit_model:
+            log_llm.warning("Deep Audit: модель не задана для провайдера «%s» — возвращаю черновик без проверки", provider_name)
+            return draft_answer
 
         # 2. Динамическое ветвление промпта
         if not gathered_context or len(gathered_context.strip()) < 10:
@@ -9859,54 +10678,40 @@ class App(ctk.CTk):
             {"role": "user", "content": f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_query}\n\nКОНТЕКСТ: {gathered_context}\n\nЧЕРНОВИК: {shielded_draft}"}
         ]
 
-        # 4. Синхронный API-вызов к OpenRouter
-        vault_data = get_vault_data()
-        headers = {
-            "Authorization": f"Bearer {vault_data.get('openrouter_key', '')}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/ai-agent",
-            "X-Title": "AI-Agent-QMS"
-        }
-        payload = {
-            "model": audit_model,
-            "messages": messages,
-            "temperature": 0.1  # Строгость аудитора
-        }
-
+        # 4. Синхронный SDK-вызов через активный чат-провайдер (v2.2.0: прямые HTTP-запросы
+        # на openrouter.ai заменены — аудитор всегда идёт тем же провайдером, что и основная модель)
         t0 = time.time()
         try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                proxies=(lambda p: {"http": p, "https": p} if p else None)(_proxy_url_from_settings()),
+            response = get_chat_llm_client(role=self.current_role).chat.completions.create(
+                model=audit_model,
+                messages=messages,
+                temperature=0.1,  # Строгость аудитора
                 timeout=60
             )
-            response.raise_for_status()
-            resp_json = response.json()
-            audited_text = resp_json["choices"][0]["message"]["content"].strip()
-            usage = resp_json.get("usage") or {}
-            log_llm.info("Deep Audit: model=%s, latency=%.2fs, status=ok, prompt_tokens=%s, completion_tokens=%s",
-                         audit_model, time.time() - t0,
-                         usage.get("prompt_tokens"), usage.get("completion_tokens"))
+            audited_text = (response.choices[0].message.content or "").strip()
+            usage = getattr(response, "usage", None)
+            log_llm.info("Deep Audit: model=%s, provider=%s, latency=%.2fs, status=ok, prompt_tokens=%s, completion_tokens=%s",
+                         audit_model, provider_name, time.time() - t0,
+                         getattr(usage, "prompt_tokens", None), getattr(usage, "completion_tokens", None))
 
             # Возвращаем оригинальные ссылки в итоговый текст
             for placeholder, original_link in link_map.items():
                 audited_text = audited_text.replace(placeholder, original_link)
 
             return audited_text
-        except requests.HTTPError as e:
+        except openai.APIStatusError as e:
             error_body = ""
             try:
-                error_body = e.response.text[:1000] if e.response is not None else ""
+                raw_resp = getattr(e, "response", None)
+                error_body = str(getattr(raw_resp, "text", ""))[:1000] if raw_resp is not None else ""
             except Exception:
                 pass
-            log_llm.error("Deep Audit: HTTP ошибка (%s), model=%s: %s body=%s",
-                          _classify_net_error(e), audit_model, _mask_secrets(e), _mask_secrets(error_body))
+            log_llm.error("Deep Audit: HTTP ошибка (%s), provider=%s, model=%s: %s body=%s",
+                          _classify_net_error(e), provider_name, audit_model, _mask_secrets(e), _mask_secrets(error_body))
             return draft_answer
         except Exception as e:
-            log_llm.error("Deep Audit: ошибка (%s), model=%s: %s. Возвращаю черновик без проверки.",
-                          _classify_net_error(e), audit_model, _mask_secrets(e))
+            log_llm.error("Deep Audit: ошибка (%s), provider=%s, model=%s: %s. Возвращаю черновик без проверки.",
+                          _classify_net_error(e), provider_name, audit_model, _mask_secrets(e))
             return draft_answer
 
     def execute_tool(self, func_name, args):
@@ -10209,10 +11014,15 @@ class App(ctk.CTk):
                     })
                 try:
                     start_index = self.chat_textbox.index("end-1c")
-                    if getattr(self, "current_role", "guest") == "admin":
-                        current_model = self.current_settings.get("admin_model", "openai/gpt-4o-mini")
-                    else:
-                        current_model = self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free")
+                    # Решение 11 плана v2.2.0: провайдер/модель разрешаются КАЖДЫЙ ШАГ цикла —
+                    # смена в середине забега подхватывается со следующего шага.
+                    provider_name, current_model = _get_chat_model_for_role(self)
+                    if not current_model:
+                        raise RuntimeError(
+                            f"Установите ID модели для провайдера «{provider_name}» на вкладке «Модели» "
+                            f"(роль: {getattr(self, 'current_role', 'guest')}).")
+                    if provider_name == "Custom" and not (load_local_settings().get("custom_llm_base_url") or "").strip():
+                        raise RuntimeError("Задайте Base URL альтернативного провайдера (Custom) на вкладке «Модели».")
                 
                     create_params = {
                         "model": current_model,
@@ -10243,17 +11053,20 @@ class App(ctk.CTk):
                             # Без тихого fallback на глобальное значение (сознательное решение).
                             effort = None
                         # карта пустая (offline/первый запуск) или efforts is None → отправляем как есть
-                    if effort:
+                    # extra_body шлётся ТОЛЬКО при провайдере с openrouter-форматом reasoning (v2.2.0):
+                    # у прочих (OpenCode Go/CommandCode/Custom) этот параметр не поддержан — расчёт
+                    # effort не тронут, гардится сама отправка.
+                    if effort and _LLM_PROVIDERS.get(provider_name, {}).get("reasoning") == "openrouter_extra_body":
                         # extra_body — совместимо с любой версией openai SDK (рекомендованный формат OpenRouter)
                         create_params["extra_body"] = {"reasoning": {"effort": effort}}
-                    log_llm.info("agent_loop: params: temperature=%s, effort=%s (model=%s)",
-                                 create_params.get("temperature"), effort or "—", current_model)
+                    log_llm.info("agent_loop: params: provider=%s, temperature=%s, effort=%s (model=%s)",
+                                 provider_name, create_params.get("temperature"), effort or "—", current_model)
                 
                     max_retries = 3
                     t_call = time.time()
                     for retry in range(max_retries):
                         try:
-                            response = get_llm_client().chat.completions.create(**create_params)
+                            response = get_chat_llm_client(role=self.current_role).chat.completions.create(**create_params)
                             break
                         except Exception as api_err:
                             if retry < max_retries - 1 and ("429" in str(api_err) or "rate" in str(api_err).lower()):
@@ -10624,10 +11437,11 @@ class App(ctk.CTk):
                 )
             })
 
-            if getattr(self, "current_role", "guest") == "admin":
-                current_model = self.current_settings.get("admin_model", "openai/gpt-4o-mini")
-            else:
-                current_model = self.current_settings.get("guest_model", "stepfun/step-3.5-flash:free")
+            provider_name, current_model = _get_chat_model_for_role(self)
+            if not current_model:
+                raise RuntimeError(
+                    f"Установите ID модели для провайдера «{provider_name}» на вкладке «Модели» "
+                    f"(роль: {getattr(self, 'current_role', 'guest')}).")
 
             self.append_to_chat("\n🧩 Финальный ответ (собран по частичным данным):\n")
             create_params = {
@@ -10638,7 +11452,7 @@ class App(ctk.CTk):
             }
             synthesis_parts = []
             start_index = self.chat_textbox.index("end-1c")
-            response = get_llm_client().chat.completions.create(**create_params)
+            response = get_chat_llm_client(role=self.current_role).chat.completions.create(**create_params)
             for chunk in response:
                 if not chunk.choices:
                     continue
