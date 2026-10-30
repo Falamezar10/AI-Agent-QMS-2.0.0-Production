@@ -7,6 +7,7 @@ import uuid
 import glob
 import os
 import hashlib
+import html
 import unicodedata
 import difflib
 import sys
@@ -1829,10 +1830,233 @@ def _xwiki_form_login(session, page_url, login, password):
     except Exception:
         return False
 
+def _xwiki_page_url(fullname, host, wiki_name):
+    """URL страницы из пары (fullname, host, wiki) — мультивики-синк v2.3.0 (D-2026-10-30-01).
+    Точный strip ТОЛЬКО префикса document: — двоеточия в имени пространства («1С: ERP»)
+    НЕ вырезаются (раньше split(":")[-1] ломал такие страницы вечной 404); strip ".WebHome"
+    (ровно 8 символов) и развёртка экранированных точек "\\." как раньше; каноническая
+    форма: {host}/wiki/{wiki_name}/view/{page_path}."""
+    try:
+        page = str(fullname or "").strip()
+        if page.startswith("document:"):
+            page = page[len("document:"):]
+        # XWiki-сериализация экранирует спецсимволы имён обратным слешем: в
+        # data-xwiki-document двоеточие пространства «1С: ERP» приходит как «1С\: ERP» —
+        # разворачиваем, иначе URL со встроенным backslash даёт вечную 404 (live-проба 2026-10-30)
+        page = page.replace("\\:", ":")
+        if not page:
+            return ""
+        # Удаляем .WebHome на конце (РОВНО 8 СИМВОЛОВ)
+        if page.endswith(".WebHome"):
+            page = page[:-8]
+        # ЗАЩИТА ОТ ЭКРАНИРОВАННЫХ ТОЧЕК XWIKI (\.)
+        temp_id = page.replace("\\.", "__ESCAPED_DOT__")
+        parts = temp_id.split(".")
+        safe_parts = [quote(part.replace("__ESCAPED_DOT__", ".")) for part in parts]
+        page_path = "/".join(safe_parts)
+        return unquote(f"{host}/wiki/{wiki_name}/view/{page_path}")
+    except Exception as e:
+        log_xwiki.error("XWiki: ошибка формирования URL для %s: %s", fullname, e)
+        return ""
+
+
+def _xwiki_link_zone(full_link, host):
+    """Вики-зона абсолютной ссылки-СТРАНИЦЫ (v2.3.0, D-2026-10-30-01):
+    {host}/wiki/{W}/view/… → W; {host}/bin/view/… → «__bin__» (главная вики); иначе None.
+    Ссылки-операции (/download/, /bin/ без view, /edit/ и пр.) — None: в паучью
+    очередь страниц они попадать не должны (забота вложений — у процесса вложений)."""
+    try:
+        u = str(full_link or "")
+        h = str(host or "")
+        if not u or not h:
+            return None
+        if u.startswith(h + "/bin/view/"):
+            return "__bin__"
+        if u.startswith(h + "/wiki/"):
+            rest = u[len(h) + len("/wiki/"):]
+            head, sep, _tail = rest.partition("/view/")
+            if sep and head:
+                return head
+        return None
+    except Exception:
+        return None
+
+
+def _xwiki_404_suggestions(html_text, limit=3):
+    """Диагностика 404 (v2.3.0, факт-уточнение 2026-10-30): подсказки XWiki «Вы искали
+    одну из следующих страниц?» — блок div.docdoesnotexist-solr-container → ul → li > a.
+    Возвращает [(текст, href-декодированный)]. ВНИМАНИЕ: это НЕ готовый новый путь —
+    в живой пробе href остаётся старым путём, текст лишь отображаемый вариант;
+    решение о замене цели в настройках — за человеком."""
+    out = []
+    try:
+        soup = BeautifulSoup(str(html_text or ""), "html.parser")
+        block = soup.find("div", class_="docdoesnotexist-solr-container")
+        ul = block.find("ul") if block else None
+        if not ul:
+            return out
+        for a in ul.find_all("a", href=True):
+            title = " ".join(a.get_text().split())
+            href = unquote(a.get("href", ""))
+            if title:
+                out.append((title, href.rstrip("/")))
+            if len(out) >= max(1, int(limit)):
+                break
+    except Exception:
+        return out
+    return out
+
+
+def _xwiki_404_recycle_info(html_text):
+    """Диагностика 404 (v2.3.0): блок корзины XWiki (p.recyclebin-message + таблица
+    «Удалил / Дата удаления») → (кто удалил, дата) или None; готовый текст ячеек,
+    даты не разбираем. Живой пример: «Кристина Гренёва», «2026/10/21 19:54»."""
+    try:
+        soup = BeautifulSoup(str(html_text or ""), "html.parser")
+        if not soup.find("p", class_="recyclebin-message"):
+            return None
+        table = soup.find("p", class_="recyclebin-message").find_next("table")
+        if not table:
+            return None
+        row = table.find("tr")
+        row = table.find("tbody").find("tr") if table.find("tbody") else row
+        if not row:
+            return None
+        cells = [" ".join(td.get_text().split()) for td in row.find_all("td")]
+        if len(cells) < 2:
+            return None
+        return (cells[0], cells[1])
+    except Exception:
+        return None
+
+
+def _data_image_entry(src, display=None):
+    """data-URI-картинка (inline base64, v2.3.0 — диаграммы XWiki Diagram) →
+    (img_name, ext, display, bytes) или None. Формат ограничен png/jpg/jpeg
+    (svg у Vision-пайпа без рендера нет); имя = md5(БАЙТОВ) — стабильно
+    между синками при неизменном содержимом (Smart Delta Cache и vision-кэш)."""
+    if not src or not str(src).startswith("data:image/"):
+        return None
+    try:
+        _head, _sep, _b64 = str(src).partition(",")
+        if not _sep:
+            return None
+        fmt = str(_head[len("data:image/"):]).split(";")[0].strip().lower()
+        if fmt not in ("png", "jpg", "jpeg"):
+            return None
+        data = base64.b64decode(_b64 + "=" * (-len(_b64) % 4))
+        img_name = hashlib.md5(data).hexdigest() + f".{fmt}"
+        return (img_name, f".{fmt}", display or "Иллюстрация (inline)", data)
+    except Exception:
+        return None
+
+
+def _extract_xwiki_diagrams(content_block):
+    """Извлечение схем XWiki Diagram (v2.3.0, факт 2026-10-30: Diagram_ASMB_* качался
+    пустым): серверный HTML рендерит <div class="diagram" data-model="mxGraphModel…">
+    ПУСТЫМ — рисует JS; текст узлов лежит в value-атрибутах mxCell, сам рендер —
+    во встроенных base64-картинках (image=data:image/png,…).
+    Расшифровка ЛОГИКИ схемы без Vision: ячейки edge="1" с source/target — стрелки
+    между узлами; подпись стрелки (value edge) — в составе связи.
+    Возвращает (text_md_lines, embedded_images):
+      text_md_lines — строки [!ДИАГРАММА] (блоки ≤40; связи ≤80) для контента;
+      embedded_images — [(data_uri, img_name, ext, bytes, display)]."""
+    text_md = []
+    embedded = []
+    try:
+        divs = content_block.find_all("div", class_="diagram") if content_block else []
+        for div in divs:
+            model = div.get("data-model") or ""
+            if not model:
+                continue
+
+            def _mx_attr(_attrs, _name):
+                _m = re.search(_name + r'="((?:\\.|[^"])*)"', _attrs)
+                return _m.group(1) if _m else ""
+
+            # Один проход по всем ячейкам: узлы (текст), рёбра (стрелки source→target)
+            id2label = {}
+            id_known = set()
+            node_texts = []
+            raw_edges = []
+            for attrs in re.findall(r"<mxCell\s+([^>]*?)\s*/?>", model, re.S):
+                _val = _mx_attr(attrs, "value")
+                _cid = _mx_attr(attrs, "id")
+                if 'edge="1"' in attrs:
+                    raw_edges.append((_mx_attr(attrs, "source"), _mx_attr(attrs, "target"), _val))
+                elif _cid:
+                    id_known.add(_cid)
+                    if _val.strip():
+                        # data-model дважды экранирован: после декода атрибута mxCell-values
+                        # остаются &lt;b&gt;… — второй unescape, иначе теги оседают в тексте
+                        label = " ".join(BeautifulSoup(html.unescape(_val), "html.parser").get_text().split())
+                        if len(label) >= 2:
+                            id2label[_cid] = label
+                            node_texts.append(label)
+
+            # Текстовый слой узлов (≤40, дедуп), затем связи (≤80): «A —[да]→ B»
+            seen = set()
+            for label in node_texts:
+                if label not in seen:
+                    seen.add(label)
+                    text_md.append(f"> [!ДИАГРАММА] {label}")
+                    if len(seen) >= 40:
+                        break
+
+            def _elabel(_cid):
+                if _cid in id2label:
+                    _l = id2label[_cid]
+                    return _l[:60] + ("…" if len(_l) > 60 else "")
+                if _cid in id_known:
+                    # узел существует, но без текста (фигура/рендер) — связь всё равно сохраняем
+                    return f"(блок {_cid} без подписи)"
+                return None
+
+            edge_seen = set()
+            for _src, _tgt, _elab in raw_edges:
+                _sl = _elabel(_src)
+                _tl = _elabel(_tgt)
+                if not _sl or not _tl:
+                    continue
+                _elab = html.unescape(_elab).strip()
+                _pack = (_sl, _tl, _elab)
+                if _pack in edge_seen:
+                    continue
+                edge_seen.add(_pack)
+                if _pack[2]:
+                    text_md.append(f"> [!ДИАГРАММА] Связь: {_sl} —[{_pack[2]}]→ {_tl}")
+                else:
+                    text_md.append(f"> [!ДИАГРАММА] Связь: {_sl} → {_tl}")
+                if len(edge_seen) >= 80:
+                    hidden = len(raw_edges) - len(edge_seen)
+                    if hidden > 0:
+                        text_md.append(f"> [!ДИАГРАММА] …(ещё {hidden} связей не показано)")
+                    break
+
+            # Встроенные рендеры диаграммы (base64)
+            for m in re.finditer(r"image=data:image/([A-Za-z0-9]+),([A-Za-z0-9+/=\r\n]+)", model):
+                fmt = m.group(1).lower()
+                if fmt not in ("png", "jpg", "jpeg"):
+                    continue
+                try:
+                    data = base64.b64decode(m.group(2) + "=" * (-len(m.group(2)) % 4))
+                except Exception:
+                    continue
+                img_name = hashlib.md5(data).hexdigest() + f".{fmt}"
+                data_uri = f"data:image/{fmt};base64,{m.group(2)}"
+                embedded.append((data_uri, img_name, f".{fmt}", data, "Диаграмма (inline)"))
+    except Exception:
+        return text_md, embedded
+    return text_md, embedded
+
+
 def sync_xwiki(app_instance=None):
     """
     Синхронизация документов с XWiki.
-    Алгоритм: JSTree AJAX Crawler + Smart Web Spider v13.
+    Алгоритм: JSTree AJAX Crawler + Smart Web Spider v13 (с v2.3.0 — per-target вики:
+    URL каждой страницы строится по СВОЕЙ вики/хосту; с v2.3.1 паучья догрузка
+    ограничена глубиной xwiki_spider_depth 0–5: 0 = отключена, перескан только
+    discovery-целей; N≥1 = до N переходов, кросс-вики только в target'ы).
     Использует xwiki_urls из global_settings - браузерные ссылки на разделы XWiki.
     """
     from requests.auth import HTTPBasicAuth
@@ -1847,7 +2071,19 @@ def sync_xwiki(app_instance=None):
             log_xwiki.warning("XWiki: логин или пароль не настроены")
             return
 
-        xwiki_urls = load_global_settings().get("xwiki_urls", [])
+        _g_settings = load_global_settings()
+        xwiki_urls = _g_settings.get("xwiki_urls", [])
+        # П.Е (v2.3.1, шкала сдвинута решением пользователя 2026-10-31): глубина паучьей
+        # догрузки 0–5. 0 = паучья догрузка ОТКЛЮЧЕНА — пересканируются только discovery-цели;
+        # N≥1 = лимит N переходов для ВСЕЙ догрузки (свои вики тоже), кросс-вики — только
+        # в вики из списка target'ов. «Без лимита» на шкале нет: N=5 покрывает корпус
+        # де-факто (структура вики мелкая по глубине, прод-наблюдение 2026-10-31).
+        try:
+            spider_depth = max(0, min(5, int(_g_settings.get("xwiki_spider_depth", 0))))
+        except Exception:
+            spider_depth = 0
+        log_xwiki.info("XWiki: глубина паучьей догрузки паука: %s",
+                       str(spider_depth) if spider_depth else "отключена (только discovery-цели)")
         xwiki_dir = os.path.join(get_base_path(), ".cache", "xwiki_sync")
         
         if not xwiki_urls:
@@ -1905,16 +2141,15 @@ def sync_xwiki(app_instance=None):
         except Exception as e:
             log_xwiki.warning("XWiki: form-вход не удался (%s) — остаёмся на Basic-auth", e)
 
-        # ШАГ 2: JSTree Discovery (Поиск всех ID в базе)
-        all_fullnames = set()
-        target_bases = []
-
-        # Нормализатор URL: убирает якоря, параметры и концевые слеши
-        def normalize_url(u):
-            if not u: return ""
-            u_clean = unquote(u.split('#')[0].split('?')[0])
-            # Используем rstrip, чтобы удалять ТОЛЬКО слеши, не затрагивая буквы!
-            return u_clean.rstrip('/')
+        # ШАГ 2: JSTree Discovery (per-target вики, v2.3.0): wiki_name → [host, set(fullname)]
+        # Каждая страница очереди знает свою вики/хост — URL строится по СВОЕЙ вике,
+        # одинаковые Space.Page разных вики больше не теряются (дедуп по паре).
+        pages_by_wiki = {}
+        bin_wiki_name = None  # имя bin-вики из target'а с /bin/view/-формой (ожидаемо "xwiki")
+        # Диагностика устаревших целей (v2.3.0): не-200 цели собираются, чтобы после
+        # discovery выдать ОДНУ строку перечня (подсказки XWiki + блок корзины —
+        # так удалённые/переименованные страницы видны в каждом утреннем логе)
+        stale_targets = []  # (url, код HTTP, [(подсказка, href)…], (удалил, дата)|None)
 
         for url in xwiki_urls:
             try:
@@ -1933,6 +2168,19 @@ def sync_xwiki(app_instance=None):
                         time.sleep(5)
                 if resp.status_code != 200:
                     log_xwiki.warning("XWiki: ошибка загрузки %s: HTTP %s", url, resp.status_code)
+                    # Диагностика 404 (v2.3.0): подсказки похожих страниц + факт корзины
+                    sugg = []
+                    recycle = None
+                    if resp.status_code == 404:
+                        try:
+                            sugg = _xwiki_404_suggestions(resp.text)
+                        except Exception as sugg_err:
+                            log_xwiki.info("XWiki: подсказки 404 не распознаны (%s)", sugg_err)
+                        try:
+                            recycle = _xwiki_404_recycle_info(resp.text)
+                        except Exception:
+                            recycle = None
+                    stale_targets.append((url, resp.status_code, sugg, recycle))
                     continue
                 resp.encoding = "utf-8"  # сервер не отдаёт charset — фикс mojibake в кэше
 
@@ -1950,28 +2198,37 @@ def sync_xwiki(app_instance=None):
                     parsed = urlparse(url)
                     path_parts = [unquote(p) for p in parsed.path.split('/') if p]
                     if len(path_parts) >= 4:
-                        wiki_name = path_parts[1]
-                        true_document = ".".join(path_parts[3:]).replace(".WebHome", "")
+                        if path_parts[0] == "bin":
+                            # bin-форма главной вики фермы: {host}/bin/view/Space.Page —
+                            # вики по префиксу пути НЕ «bin» (без данных это "xwiki")
+                            wiki_name = "xwiki"
+                            true_document = ".".join(path_parts[3:]).replace(".WebHome", "")
+                        else:
+                            wiki_name = path_parts[1]
+                            true_document = ".".join(path_parts[3:]).replace(".WebHome", "")
+
+                # bin-форма target'а: запоминаем имя bin-вики (первый такой target)
+                if urlparse(url).path.startswith('/bin/') and bin_wiki_name is None and wiki_name:
+                    bin_wiki_name = wiki_name
 
                 # Формируем базовый URL для API
                 base_get_url = url.split('#')[0].split('?')[0].replace('/view/', '/get/')
                 parsed = urlparse(url)
                 host = f"{parsed.scheme}://{parsed.netloc}"
 
-                # Собираем базовые URL для Spider-фильтрации
-                t_base = normalize_url(f"{host}/wiki/{wiki_name}/view/")
-                target_bases.append(t_base)
+                wiki_entry = pages_by_wiki.setdefault(wiki_name, [host, set()])
+                if not wiki_entry[0]:
+                    wiki_entry[0] = host
 
-                # Рекурсивная функция обхода дерева
-                def crawl_tree(doc_fullname):
+                # Рекурсивная функция обхода дерева (документы пишутся в набор СВОЕЙ вики)
+                def crawl_tree(doc_fullname, wname, hst, api_url):
                     """Рекурсивно обходит дерево документов XWiki через JSTree API."""
                     try:
-                        api_url = base_get_url
                         params = {
                             "sheet": "XWiki.DocumentTree",
                             "outputSyntax": "plain",
                             "data": "children",
-                            "id": f"document:{wiki_name}:{doc_fullname}"
+                            "id": f"document:{wname}:{doc_fullname}"
                         }
 
                         api_resp = session.get(api_url, params=params, timeout=30)
@@ -1990,55 +2247,83 @@ def sync_xwiki(app_instance=None):
                             node_id = node_data.get("id", "")  # Формат "document:wiki:Space.Page"
 
                             if node_id and ":" in node_id:
-                                # Забираем всё, что после второй двоеточия (Space.Page)
                                 parts = node_id.split(":", 2)
-                                doc_id = parts[-1]
-                                if doc_id not in all_fullnames:
-                                    all_fullnames.add(doc_id)
-                                    crawl_tree(doc_id)
+                                doc_id = parts[-1]  # Space.Page (без wiki-префикса)
+                                nwiki = parts[1] if len(parts) == 3 else wname
+                                entry = pages_by_wiki.setdefault(nwiki, [hst, set()])
+                                if doc_id and doc_id not in entry[1]:
+                                    entry[1].add(doc_id)
+                                    crawl_tree(doc_id, nwiki, hst, api_url)
                     except Exception as e:
                         pass
 
                 # Запускаем обход с корневого документа
-                all_fullnames.add(true_document)
-                crawl_tree(true_document)
+                count_before_target = len(wiki_entry[1])
+                if true_document and true_document not in wiki_entry[1]:
+                    wiki_entry[1].add(true_document)
+                crawl_tree(true_document, wiki_name, host, base_get_url)
 
-                log_xwiki.info("XWiki: найдено %d документов в %s", len(all_fullnames), url)
+                log_xwiki.info("XWiki: target %s (вики %s): найдено %d новых документов",
+                               url, wiki_name, len(wiki_entry[1]) - count_before_target)
 
             except Exception as e:
                 log_xwiki.error("XWiki: ошибка JSTree discovery для %s (%s): %s", url, _classify_net_error(e), e)
 
-        if not all_fullnames:
+        # Диагностика устаревших/недоступных целей (v2.3.0): ОДНА сводная строка после discovery
+        if stale_targets:
+            stale_parts = []
+            for s_url, s_code, s_sugg, s_recycle in stale_targets:
+                try:
+                    s_path = urlparse(unquote(s_url)).path.rstrip("/")
+                except Exception:
+                    s_path = unquote(s_url).rstrip("/")
+                s_text = f"{s_path} (HTTP {s_code}"
+                if s_recycle:
+                    s_text += f"; страница в корзине: удалил {s_recycle[0]}, {s_recycle[1]}"
+                if s_sugg:
+                    s_text += "; похожие страницы: " + ", ".join(t for t, _h in s_sugg)
+                stale_parts.append(s_text + ")")
+            log_xwiki.info("XWiki: устаревших/недоступных целей: %d — %s "
+                           "(страница в корзине = документ удалён/переименован; обзор списка "
+                           "target'ов — за администратором)", len(stale_targets), "; ".join(stale_parts))
+
+        if not pages_by_wiki or not sum(len(s) for _h, s in pages_by_wiki.values()):
             log_xwiki.warning("XWiki: не найдено ни одного документа")
             return
 
-        # ШАГ 3: Формирование очереди скачивания (Queue)
+        wikis_in_config = list(pages_by_wiki.keys())
+        if len(wikis_in_config) >= 2:
+            # Смешанный конфиг — рабочий сценарий v2.3.0 (D-2026-10-30-01), запрещать нечего
+            log_xwiki.info("XWiki: смешанная конфигурация поддержана, вики: %s",
+                           ", ".join(wikis_in_config))
+
+        # ШАГ 3: Формирование очереди скачивания — из пар (host, wiki, fullname)
         queue_urls = []
         visited_urls = set()
+        url_wiki_map = {}   # канонический URL страницы → её вики
+        url_host_map = {}   # канонический URL страницы → её хост
+        url_depth_map = {}  # канонический URL → глубина догрузки (п.Е): цели discovery = 0, паучья ссылка = родитель+1
 
-        for fullname in all_fullnames:
-            try:
-                # Удаляем префикс вики (если есть)
-                clean_id = fullname.split(":")[-1] if ":" in fullname else fullname
+        for wiki_name, (host, fullnames) in pages_by_wiki.items():
+            for fullname in sorted(fullnames):
+                p_url = _xwiki_page_url(fullname, host, wiki_name)
+                if not p_url or p_url in url_host_map:
+                    continue
+                url_host_map[p_url] = host
+                url_wiki_map[p_url] = wiki_name
+                url_depth_map[p_url] = 0
+                queue_urls.append(p_url)
 
-                # Удаляем .WebHome на конце (РОВНО 8 СИМВОЛОВ!)
-                if clean_id.endswith(".WebHome"):
-                    clean_id = clean_id[:-8]
+        if not queue_urls:
+            log_xwiki.warning("XWiki: очередь скачивания пуста")
+            return
 
-                # Формируем путь: ЗАЩИТА ОТ ЭКРАНИРОВАННЫХ ТОЧЕК XWIKI (\.)
-                temp_id = clean_id.replace("\\.", "__ESCAPED_DOT__")
-                parts = temp_id.split(".")
-                safe_parts = [quote(part.replace("__ESCAPED_DOT__", ".")) for part in parts]
-                page_path = "/".join(safe_parts)
-                
-                # БЕЗ СЛЕША НА КОНЦЕ!
-                p_url = f"{host}/wiki/{wiki_name}/view/{page_path}"
-
-                queue_urls.append(unquote(p_url))
-            except Exception as e:
-                log_xwiki.error("XWiki: ошибка формирования URL для %s: %s", fullname, e)
-
-        log_xwiki.info("XWiki: всего в очереди %d страниц", len(queue_urls))
+        wiki_queue_counts = {}
+        for u in queue_urls:
+            w = url_wiki_map.get(u) or "?"
+            wiki_queue_counts[w] = wiki_queue_counts.get(w, 0) + 1
+        log_xwiki.info("XWiki: всего в очереди %d страниц (%s)", len(queue_urls),
+                       ", ".join(f"{w}={n}" for w, n in sorted(wiki_queue_counts.items())))
 
         # ШАГ 4: Гибридный Паук и Vision Pipeline (Главный цикл)
         processed_count = 0
@@ -2046,6 +2331,11 @@ def sync_xwiki(app_instance=None):
         active_images = set() # Журнал всех актуальных картинок (attachments)
         hit_login_guard = False # Флаг: в середине синка получена страница входа (вместо контента)
         vision_circuit_ui_notified = False # Сообщение о недоступности Vision OCR в UI — однократно за синк
+        # Диагностика паука (v2.3.0): добавление по вики + счётчики (п.Е v2.3.1 — плюс лимит глубины)
+        spider_added = 0
+        spider_added_by_wiki = {}
+        spider_rejected = 0
+        spider_depth_rejected = 0
 
         while queue_urls:
             current_url = queue_urls.pop(0)
@@ -2054,6 +2344,25 @@ def sync_xwiki(app_instance=None):
             if current_url in visited_urls:
                 continue
             visited_urls.add(current_url)
+
+            # Своя вики/хост страницы: URL всегда строится по СВОЕЙ вике (per-target модель)
+            page_wiki = url_wiki_map.get(current_url) or ""
+            page_host = url_host_map.get(current_url) or ""
+            if not page_host:
+                try:
+                    _pu = urlparse(current_url)
+                    page_host = f"{_pu.scheme}://{_pu.netloc}"
+                except Exception:
+                    page_host = ""
+            if not page_wiki:
+                try:
+                    _ppath = urlparse(current_url).path
+                    if "/wiki/" in _ppath:
+                        _pw = _ppath.split("/wiki/", 1)[1]
+                        if "/view/" in _pw:
+                            page_wiki = _pw.split("/view/", 1)[0]
+                except Exception:
+                    page_wiki = ""
 
             # Обновление прогресса в UI
             if app_instance is not None:
@@ -2090,19 +2399,71 @@ def sync_xwiki(app_instance=None):
                     hit_login_guard = True
                     continue
 
-                # Web Spider: ищем ссылки внутри контента
+                # Извлечение диаграмм XWiki Diagram (v2.3.0, факт 2026-10-30: страницы
+                # Diagram_ASMB_* качались пустыми): серверный HTML рендерит <div class=
+                # "diagram" data-model="mxGraphModel…"> пустым — рисует его JS. Текст
+                # узлов — в value-атрибутах mxCell; рендер — во встроенных base64-PNG.
+                # Вставляем [!ДИАГРАММА]-текст и СИНТЕТИЧЕСКИЕ <img data:…> в контент,
+                # чтобы штатный пайплайн картинок (fast-path + Vision OCR) обработал их
+                # как обычные иллюстрации: имя по md5(байтов) — стабильно между синками.
+                try:
+                    _dg_texts, _dg_images = _extract_xwiki_diagrams(content_block)
+                    if _dg_texts:
+                        content_block.append(BeautifulSoup("\n\n" + "\n\n".join(_dg_texts) + "\n\n", "html.parser"))
+                        log_xwiki.info("XWiki: диаграмма %s — текстовых подписей узлов: %d", current_url, len(_dg_texts))
+                    if _dg_images:
+                        _leaf = unquote(urlparse(current_url).path).rstrip("/").split("/")[-1] or "диаграмма"
+                        for _dg_uri, _dg_hn, _dg_ext, _dg_bytes, _dg_disp in _dg_images:
+                            _dg_tag = soup.new_tag("img")
+                            _dg_tag["src"] = _dg_uri
+                            _dg_tag["data-diagram-name"] = f"Диаграмма {_leaf}"
+                            content_block.append(_dg_tag)
+                        log_xwiki.info("XWiki: диаграмма XWiki Diagram на странице %s: встроенных изображений %d (%s)",
+                                       current_url, len(_dg_images), _leaf)
+                except Exception as dg_err:
+                    log_xwiki.warning("XWiki: обработка диаграмм на %s не удалась: %s", current_url, dg_err)
+
+                # Web Spider: ищем ссылки внутри контента (строгая изоляция вики v2.3.0):
+                # в очередь кладём ТОЛЬКО ссылки на вики текущей страницы (bin-зона — при
+                # bin_wiki_name = вики страницы); чужие вики — только прямым target'ом.
                 for a in content_block.find_all("a", href=True):
                     href = a.get("href", "")
                     clean_href = unquote(href.split('#')[0].split('?')[0]).rstrip('/')
 
-                    # Приводим к полному абсолютному URL для сравнения
-                    full_link = host + clean_href if clean_href.startswith("/") else clean_href
-                    
-                    # Разрешаем скачивать только если ссылка находится внутри одного из разрешенных разделов (target_bases)
-                    is_valid = any(full_link.startswith(tb) for tb in target_bases)
+                    # Приводим к полному абсолютному URL от хоста ТЕКУЩЕЙ страницы
+                    full_link = page_host + clean_href if clean_href.startswith("/") else clean_href
 
-                    if is_valid and full_link not in visited_urls and full_link not in queue_urls:
-                        queue_urls.append(full_link)
+                    zone = _xwiki_link_zone(full_link, page_host)
+                    link_wiki = bin_wiki_name if zone == "__bin__" else zone
+                    if not link_wiki or link_wiki != page_wiki:
+                        # П.Е (v2.3.1): при N=0 паучья догрузка отключена — свои ссылки
+                        # отбракуются гейтом глубины ниже; при N≥1 кросс-вики разрешена
+                        # ТОЛЬКО в вики из списка target'ов
+                        if spider_depth == 0 or link_wiki not in pages_by_wiki:
+                            spider_rejected += 1
+                            continue
+
+                    # П.Е: лимит глубины ВСЕЙ догрузки: при N=0 паучьи ссылки НЕ добавляются
+                    # вообще; при N≥1 страница глубины k порождает детей k+1, ссылка
+                    # добавляется только при глубине родителя < N
+                    parent_depth = url_depth_map.get(current_url, 0)
+                    if not spider_depth or parent_depth >= spider_depth:
+                        spider_depth_rejected += 1
+                        continue
+
+                    # Канонизация bin-ссылок в /wiki/{bin_wiki_name}/view/ форму
+                    # (форма совпадает с прод-states, дублированных md-кэшей не появится)
+                    cand_url = full_link
+                    if zone == "__bin__" and bin_wiki_name:
+                        cand_url = full_link.replace("/bin/view/", f"/wiki/{bin_wiki_name}/view/", 1)
+
+                    if cand_url not in visited_urls and cand_url not in queue_urls:
+                        queue_urls.append(cand_url)
+                        url_host_map[cand_url] = page_host
+                        url_wiki_map[cand_url] = link_wiki
+                        url_depth_map[cand_url] = parent_depth + 1
+                        spider_added += 1
+                        spider_added_by_wiki[link_wiki] = spider_added_by_wiki.get(link_wiki, 0) + 1
 
                 # Smart Delta Cache (Хэширование)
                 current_hash = hashlib.md5(str(content_block).encode()).hexdigest()
@@ -2117,10 +2478,21 @@ def sync_xwiki(app_instance=None):
                     for img in content_block.find_all('img'):
                         src = img.get('src', '')
                         if src:
+                            # Inline-картинка (диаграмма XWiki Diagram): имя по байтам,
+                            # ничего скачивать не нужно (v2.3.0 диаграммы)
+                            _d_entry = _data_image_entry(src, img.get("data-diagram-name"))
+                            if _d_entry:
+                                _d_name, _d_ext, _d_disp = _d_entry[0], _d_entry[1], _d_entry[2]
+                                active_images.add(_d_name)
+                                if _d_disp:
+                                    image_name_map[_d_name] = _d_disp
+                                if _d_ext in ('.png', '.jpg', '.jpeg') and not os.path.exists(_vision_cache_path(os.path.join(attachments_dir, _d_name))):
+                                    all_vision_cached = False
+                                continue
                             if not src.startswith('http'):
                                 if src.startswith('//'): src = 'https:' + src
-                                elif src.startswith('/'): src = host + src
-                                else: src = host + '/' + src
+                                elif src.startswith('/'): src = page_host + src
+                                else: src = page_host + '/' + src
                             ext = os.path.splitext(src.split('?')[0])[1]
                             if not ext or len(ext) > 5: ext = '.jpg'
                             img_name = hashlib.md5(src.encode('utf-8')).hexdigest() + ext
@@ -2182,15 +2554,45 @@ def sync_xwiki(app_instance=None):
                     if not src:
                         continue
 
+                    # Inline-картинка (диаграмма XWiki Diagram): байты уже в HTML,
+                    # складываем/переиспользуем файл по md5(байтов) и OCR-им как обычную
+                    _d_entry = _data_image_entry(src, img.get("data-diagram-name"))
+                    if _d_entry:
+                        _d_name, _d_ext, _d_disp, _d_bytes = _d_entry[0], _d_entry[1], _d_entry[2], _d_entry[3]
+                        active_images.add(_d_name)
+                        if _d_disp:
+                            image_name_map[_d_name] = _d_disp
+                        img_path = os.path.join(attachments_dir, _d_name)
+                        if not os.path.exists(img_path):
+                            try:
+                                with open(img_path, "wb") as fd:
+                                    fd.write(_d_bytes)
+                            except Exception as w_err:
+                                log_xwiki.warning("XWiki: не удалось сохранить встроенную картинку %s: %s", _d_name, w_err)
+                                continue
+                        try:
+                            vision_text = extract_smart_vision_and_pdf(img_path)
+                        except VisionAPIError as ve:
+                            log_xwiki.warning("XWiki: сбой Vision OCR для %s (kind=%s): %s", _d_name, ve.kind, ve)
+                            if _VISION_CIRCUIT["open"] and app_instance is not None and not vision_circuit_ui_notified:
+                                vision_circuit_ui_notified = True
+                                circuit_kind = _VISION_CIRCUIT.get("kind") or ve.kind
+                                app_instance.after(0, lambda k=circuit_kind: update_xwiki_progress(
+                                    app_instance, f"⚠️ Vision OCR недоступен ({k}) — проверьте прокси/ключ; распознавание отложено"))
+                            continue
+                        img.replace_with(BeautifulSoup(
+                            f"\n\n> [!MEDIA] Иллюстрация из файла {_d_name}:\n> {vision_text}\n\n", "html.parser"))
+                        continue
+
                     try:
-                        # Формируем абсолютный URL для картинки
+                        # Формируем абсолютный URL для картинки (хост текущей страницы)
                         if not src.startswith("http"):
                             if src.startswith("//"):
                                 src = "https:" + src
                             elif src.startswith("/"):
-                                src = host + src
+                                src = page_host + src
                             else:
-                                src = host + "/" + src
+                                src = page_host + "/" + src
 
                         # Определяем расширение
                         ext = os.path.splitext(src.split('?')[0])[1]
@@ -2267,7 +2669,12 @@ def sync_xwiki(app_instance=None):
                 title = ""
                 html_tag = soup.find("html")
                 if html_tag:
-                    title = html_tag.get("data-xwiki-document", "").split(".")[-1]
+                    # XWiki отдаёт полное имя с суффиксом .WebHome — срезаем ДО split,
+                    # иначе split(".")[-1] давал одинаковый титул «WebHome» всем страницам
+                    _doc_full = html_tag.get("data-xwiki-document", "")
+                    if _doc_full.endswith(".WebHome"):
+                        _doc_full = _doc_full[:-8]
+                    title = _doc_full.split(".")[-1]
                 if not title:
                     title_tag = soup.find("title")
                     if title_tag:
@@ -2294,6 +2701,16 @@ def sync_xwiki(app_instance=None):
                 log_xwiki.error("XWiki: ошибка обработки %s (%s): %s", current_url, _classify_net_error(e), e)
                 # Сохраняем стейт даже при ошибке одного документа
                 continue
+
+        # Диагностика паука (v2.3.0): одна строка на синк (п.Е v2.3.1 — плюс счётчик отказа
+        # по лимиту глубины). «добавлено» = кандидатов В ОЧЕРЕДЬ этого синка (фронт догрузки,
+        # пересчитывается каждый синк; «новые страницы» показывает счётчик «файлов переиндексировано»)
+        spider_wiki_breakdown = ", ".join(f"{w}={n}" for w, n in sorted(spider_added_by_wiki.items())) or "нет"
+        depth_txt = "отключена (только discovery-цели)" if not spider_depth else str(spider_depth)
+        log_xwiki.info("XWiki: паук: добавлено в очередь %d страниц-кандидатов (%s), "
+                       "отвергнуто %d ссылок на чужие вики/внешние, %d по лимиту глубины (глубина: %s)",
+                       spider_added, spider_wiki_breakdown, spider_rejected,
+                       spider_depth_rejected, depth_txt)
 
         # --- СБОРЩИК МУСОРA (Garbage Collector) ---
         # Пропорциональный guard (v2.1.4, #1 CRITICAL ревью 2026-09-20): прежний проверял только
@@ -3655,7 +4072,32 @@ def _push_db_to_server(self, local_db, server_db):
     shutil.rmtree(old_db, ignore_errors=True)
 
 
-def sync_vector_db(self=None):
+# Модульный guard синхронизации: единственный запуск на процесс — покрывает все 7 точек
+# входа sync_vector_db (старт, 2 кнопки, 5 самозапусков тулов с self=None, где эшелонов нет)
+_SYNC_STATE_LOCK = threading.Lock()
+_SYNC_IN_FLIGHT = False
+
+def _sync_in_flight():
+    """True, пока выполняется любая синхронизация (sync_vector_db)."""
+    with _SYNC_STATE_LOCK:
+        return globals()["_SYNC_IN_FLIGHT"]
+
+def sync_vector_db(self=None, run_xwiki=True):
+    global _SYNC_IN_FLIGHT
+    # Атомарный check-and-set ДО основного try: pending-повторы не входят в критическую
+    # секцию и не задевают чужой _db_syncing (skip-return раньше finally активного синка)
+    skip = False
+    with _SYNC_STATE_LOCK:
+        if _SYNC_IN_FLIGHT:
+            skip = True
+        else:
+            _SYNC_IN_FLIGHT = True
+    if skip:
+        log_sync.warning("Повторный запуск синхронизации отклонён: уже выполняется другая синхронизация")
+        # PULL=False ОБЯЗАТЕЛЕН: активный синк держит хэндлы баз, копание (copytree) их повреждает
+        snapshot_client = chromadb.PersistentClient(path=get_db_path(pull=False))
+        snapshot_coll = snapshot_client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
+        return snapshot_coll, snapshot_coll.count()
     try:
         # --- ПРЕДОХРАНИТЕЛЬ: Проверяем наличие реального ключа ---
         vault_data = get_vault_data()
@@ -3686,8 +4128,9 @@ def sync_vector_db(self=None):
         if self is not None:
             self._db_syncing = True
         
-        # Синхронизация XWiki только при ручном запуске из UI
-        if self is not None:
+        # Синхронизация XWiki (медленная фаза) — только у полной кнопки 🌐 (run_xwiki=True);
+        # старт и тул-самозапуски (+ быстрая кнопка) идут без неё
+        if self is not None and run_xwiki:
             self.after(0, lambda: self.file_progress_label.configure(text="Синхронизация XWiki (может занять время)..."))
             try:
                 sync_xwiki(self)
@@ -3867,6 +4310,8 @@ def sync_vector_db(self=None):
         if self is not None:
             self._db_syncing = False
             self.after(0, lambda: self.update_progress_ui(0, "Синхронизация завершена"))
+        with _SYNC_STATE_LOCK:
+            _SYNC_IN_FLIGHT = False
 
 # ==================== ИНСТРУМЕНТЫ АГЕНТА (ПК-РУКИ) ====================
 
@@ -5671,6 +6116,7 @@ DEFAULT_GLOBAL_SETTINGS = {
     "excel_closed_val": "Выполнено",
     "chroma_batch_size": 100,
     "xwiki_urls": [],
+    "xwiki_spider_depth": 0,
     "graph_rag_enabled": False,
     "graph_rag_model": "deepseek/deepseek-v4-flash-0731",
     "graph_rag_delay": 60,
@@ -5725,22 +6171,19 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.2.1 Enterprise"
+APP_VERSION = "v2.4.0 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
-    "2.2.1 - Copy/Paste и горячие клавиши при русской раскладке: Ctrl+C/X/V/A работают в чате, чат-логе "
-    "и всех полях настроек без переключения раскладки (маршрут по кириллическому event.char); "
-    "аудио-хоткей дублируется кириллическим нажатием.\n"
-    "2.2.0 - Сменяемый провайдер основной чат-модели (OpenRouter / OpenCode Go / CommandCode / свой "
-    "OpenAI-совместимый) на вкладке «Модели»: слоты моделей и прокси хранятся на каждого провайдера, "
-    "каталоги GET /models (CommandCode с фильтром по нативным форматам), reasoning-параметр только через "
-    "OpenRouter; чат, Секретарь, smart-инструменты и Deep Audit идут через активного провайдера; "
-    "сервисные пайпы (Vision, эмбеддинги, граф, rerank, аудио) остаются на OpenRouter/Groq.\n"
-    "2.1.6 - Агент научился генерировать и обрабатывать Word-документы (.docx) и оформленные Excel-таблицы (.xlsx) "
-    "через execute_python_code (python-docx/docxtpl/openpyxl); большие docx-вложения (>100 тыс. символов) вместо "
-    "полного текста дают маркер с путём для программной обработки; текстовые правки промптинга, логика песочницы "
-    "не менялась.\n"
+    "2.4.0 - Разделение синхронизации: быстрая кнопка «Синхронизировать базу» (только папки) и "
+    "кнопка «Синхронизировать XWiki» (полный цикл: XWiki + база + выгрузка); единая модульная "
+    "защита от одновременного запуска синхронизации.\n"
+    "2.3.1 - Ползунок «Глубина паучьей догрузки» на вкладке XWiki (0–5, дефолт 0): 0 — паучья "
+    "догрузка выключена (индексируются только discovery-цели), 1–5 — догрузка до N переходов "
+    "(свою вику тоже ограничивает), кросс-вики — только на вики из списка target'ов; проверки "
+    "диагностики паука с счётчиком отказа по лимиту глубины.\n"
+    "2.3.0 - Мультивики-синк XWiki: per-target URL (исправление 151×404), страницы с двоеточием "
+    "в пространстве, строгая изоляция вики паука, диагностика паука.\n"
     "Полная история изменений: docs/DECISIONS.md.\n"
     "\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
@@ -8656,10 +9099,16 @@ class App(ctk.CTk):
             print(f"Ошибка экспорта в Word: {e}")
             self.append_to_chat(f"\n[⚠️ Система: Ошибка при экспорте диалога в Word: {e}]\n\n", "system")
 
-    def manual_sync(self, sync_btn=None):
+    def manual_sync(self, sync_btn=None, run_xwiki=False):
         """Ручная синхронизация базы. sync_btn — локальная ссылка на кнопку текущего окна настроек
-        (атрибута главного окна больше нет); guard по winfo_exists на случай закрытия окна настроек."""
-        self.status_label.configure(text="Синхронизация...")
+        (атрибута главного окна больше нет); guard по winfo_exists на случай закрытия окна настроек.
+        run_xwiki=False — быстрая (только папки), True — полная (XWiki + база + выгрузка)."""
+        # Пре-чек модульного guard'а ДО disable кнопки: конкурирующий запуск не уводит кнопку в disabled
+        if _sync_in_flight():
+            self.status_label.configure(text="Синхронизация уже выполняется")
+            return
+        self.status_label.configure(
+            text="Синхронизация XWiki + базы..." if run_xwiki else "Синхронизация базы (папки)...")
         if sync_btn is not None:
             try:
                 sync_btn.configure(state="disabled")
@@ -8667,7 +9116,7 @@ class App(ctk.CTk):
                 pass
         def do_sync():
             try:
-                _, count = sync_vector_db(self)
+                _, count = sync_vector_db(self, run_xwiki=run_xwiki)
                 self.after(0, lambda: self.status_label.configure(text=f"База готова (чанков: {count})"))
             except Exception as e:
                 error_msg = str(e)
@@ -9649,6 +10098,29 @@ class App(ctk.CTk):
         xwiki_urls_scroll.pack(pady=5, fill="both", expand=True)
         render_xwiki_urls()
 
+        # --- П.Е (v2.3.1): ползунок глубины паучьей догрузки (АДМИН; шкала сдвинута 2026-10-31) ---
+        ctk.CTkLabel(tab_xwiki, text="Глубина паучьей догрузки паука (0–5):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0), anchor="w", padx=30)
+        ctk.CTkLabel(tab_xwiki, text="0 — паучья догрузка выключена: индексируются только discovery-цели\n"
+                                     "из списка выше (по умолчанию). 1–5 — паук догружает до N переходов\n"
+                                     "от целей (свою вику тоже ограничивает), кросс-вики — только\n"
+                                     "на вики из списка выше.",
+                     font=ctk.CTkFont(size=12), text_color="gray").pack(pady=(2, 5), anchor="w", padx=30)
+        self.xwiki_spider_depth_var = ctk.DoubleVar(value=float(self.global_settings.get("xwiki_spider_depth", 0)))
+        xwiki_depth_slider = ctk.CTkSlider(tab_xwiki, from_=0, to=5, number_of_steps=5, variable=self.xwiki_spider_depth_var, width=300)
+        xwiki_depth_slider.pack(pady=(5, 0), anchor="w", padx=30)
+
+        def _xwiki_depth_label(v):
+            n = int(v)
+            if n == 0:
+                return "паучья догрузка выключена (только цели)"
+            return f"до {n} перехода" if n == 1 else f"до {n} переходов"
+
+        xwiki_depth_label = ctk.CTkLabel(tab_xwiki, text=_xwiki_depth_label(self.xwiki_spider_depth_var.get()))
+        xwiki_depth_label.pack(pady=(0, 10), anchor="w", padx=30)
+        xwiki_depth_slider.configure(command=lambda v: xwiki_depth_label.configure(text=_xwiki_depth_label(v)))
+        if not is_admin:
+            xwiki_depth_slider.configure(state="disabled")
+
         # --- ВКЛАДКА: НАСТРОЙКИ EXCEL ---
         ctk.CTkLabel(tab_excel, text="Порог ячеек (CSV → Code Interpreter):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0), anchor="w", padx=30)
         ctk.CTkLabel(tab_excel, text="Если ячеек меньше порога — файл конвертируется в CSV.\nЕсли больше — используется Code Interpreter.", font=ctk.CTkFont(size=12), text_color="gray").pack(pady=(2, 5), anchor="w", padx=30)
@@ -9870,6 +10342,12 @@ class App(ctk.CTk):
 
                 # 3.1 Сохранение XWiki настроек
                 self.global_settings["xwiki_urls"] = temp_xwiki_urls.copy()
+                # Глубина паучьей догрузки (п.Е, v2.3.1) — только Админ (блок is_admin)
+                if hasattr(self, "xwiki_spider_depth_var"):
+                    try:
+                        self.global_settings["xwiki_spider_depth"] = max(0, min(5, int(self.xwiki_spider_depth_var.get())))
+                    except Exception:
+                        self.global_settings["xwiki_spider_depth"] = 0
 
                 # 3.2 Сохранение настроек Excel
                 try:
@@ -9931,11 +10409,12 @@ class App(ctk.CTk):
                           hover_color="#263238",
                           command=self.run_diagnostics).pack(side="left", padx=5)
 
-            # Ручная синхронизация БД — перенесена из sidebar; проверка пароля синхронизации из vault
-            def _manual_sync_with_password():
+            # Ручная синхронизация БД — перенесена из sidebar; проверка пароля синхронизации из vault;
+            # параметризованный гейт: и референсом кнопки, и режимом (быстрая / XWiki-полная)
+            def _manual_sync_with_password(btn, run_xwiki=False):
                 sync_pwd = get_vault_data().get("sync_password", "").strip()
                 if not sync_pwd:
-                    self.manual_sync(sync_settings_btn)
+                    self.manual_sync(btn, run_xwiki=run_xwiki)
                     return
                 # окно настроек держит grab — отпускаем на время диалога, иначе CTkInputDialog не получит события
                 try:
@@ -9950,15 +10429,20 @@ class App(ctk.CTk):
                 except Exception:
                     pass
                 if entered_pwd == sync_pwd:
-                    self.manual_sync(sync_settings_btn)
+                    self.manual_sync(btn, run_xwiki=run_xwiki)
                 else:
                     self.status_label.configure(text="Неверный пароль синхронизации")
                     log_core.warning("Отказ в ручной синхронизации БД: неверный пароль синхронизации")
 
             sync_settings_btn = ctk.CTkButton(tools_frame, text="🔄 Синхронизировать базу", width=170,
                                               fg_color="#2E7D32", hover_color="#1B5E20",
-                                              command=_manual_sync_with_password)
+                                              command=lambda: _manual_sync_with_password(sync_settings_btn, False))
             sync_settings_btn.pack(side="left", padx=5)
+
+            xwiki_btn = ctk.CTkButton(tools_frame, text="🌐 Синхронизировать XWiki", width=150,
+                                      fg_color="#2E7D32", hover_color="#1B5E20",
+                                      command=lambda: _manual_sync_with_password(xwiki_btn, True))
+            xwiki_btn.pack(side="left", padx=5)
 
         save_btn = ctk.CTkButton(settings_window, text="Сохранить", command=save, fg_color="#2E7D32", hover_color="#1B5E20")
         save_btn.pack(pady=(10, 20))
