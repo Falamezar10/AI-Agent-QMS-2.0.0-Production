@@ -43,3 +43,4 @@ scripts/test_*.py
 smk_vector_db.staging/
 smk_vector_db.old_*/
 smk_vector_db.tmp_*/
+scripts/reset_docx_image_file_states.py

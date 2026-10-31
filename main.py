@@ -827,6 +827,329 @@ def _vision_cache_path(filepath):
     return os.path.join(get_base_path(), ".cache", f"{name_without_ext}_{path_hash}_vision.md")
 
 
+# ==================== Vision OCR картинок, встроенных в docx (v2.5.0, Батч D) ====================
+
+DOCX_VISION_MIN_BYTES = 8 * 1024
+DOCX_VISION_MAX_BYTES_PER_IMAGE = 15 * 1024 * 1024
+DOCX_VISION_MAX_BLOCK_CHARS = 3000
+DOCX_VISION_MAX_TOTAL_CHARS = 40000
+_DOCVISION_WINDOW = (60, 600.0)
+_DOCVISION_WINDOW_LOCK = threading.Lock()
+_docvision_call_times = []
+_DOCVISION_MEDIA_PREFIX = "--- РАСПОЗНАНО ИЗ "
+
+
+def _docx_vision_enabled():
+    """Лимит Vision-картинок docx на файл за проход (0–100). 0 = фича выключена."""
+    try:
+        value = int(load_global_settings().get("docx_vision_max_images_per_file", 30))
+    except Exception:
+        value = 30
+    try:
+        return max(0, min(100, value))
+    except Exception:
+        return 0
+
+
+def _docvision_allow_call():
+    """Sliding-window бюджет Vision-вызовов docx: не более _DOCVISION_WINDOW[0] вызовов
+    за _DOCVISION_WINDOW[1] секунд под общим lock (синк и вложения чата делят одно окно).
+    True — вызов разрешён и отмечен в окне; False — окно исчерпано, вызов отменяется."""
+    try:
+        now = time.time()
+        max_calls, window_sec = _DOCVISION_WINDOW
+        with _DOCVISION_WINDOW_LOCK:
+            while _docvision_call_times and now - _docvision_call_times[0] > window_sec:
+                _docvision_call_times.pop(0)
+            if len(_docvision_call_times) >= max_calls:
+                return False
+            _docvision_call_times.append(now)
+            return True
+    except Exception:
+        return False
+
+
+def _docx_media_temp_path(docx_path, zip_name):
+    """Детерминированный temp-путь картинки docx: .cache/docx_media/<hash6_docx>/<hash6_docx>_<zip_name>.
+    Имя temp содержит hash ПУТИ docx, а не имя файла: «СНАЙПЕРСКИЙ ФИЛЬТР» вложений
+    (удаляет новые файлы .cache/ с именем оригинала в названии) не может совпасть
+    с hash-префиксом — свежий OCR не уничтожается сразу после вложения."""
+    docx_abs = os.path.abspath(docx_path)
+    docx_hash = hashlib.md5(docx_abs.encode("utf-8")).hexdigest()[:6]
+    media_name = os.path.basename(zip_name)
+    return os.path.join(get_base_path(), ".cache", "docx_media", docx_hash, f"{docx_hash}_{media_name}")
+
+
+def _extract_docx_media_temp(docx_path, zip_name):
+    """Ленивое извлечение картинки из docx в детерминированный temp (_docx_media_temp_path).
+    Файл пишется ОДИН раз: повторная запись обновила бы mtime temp и валит mtime-гейт кэша OCR.
+    Возвращает путь или None при ошибке (нарушенный docx)."""
+    temp_path = _docx_media_temp_path(docx_path, zip_name)
+    try:
+        if not os.path.exists(temp_path):
+            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+            import zipfile
+            with zipfile.ZipFile(docx_path) as zf:
+                data = zf.read(zip_name)
+            part_path = temp_path + ".part"
+            with open(part_path, "wb") as f:
+                f.write(data)
+            os.replace(part_path, temp_path)
+    except Exception:
+        return None
+    return temp_path
+
+
+def _docx_vision_cache_fresh(docx_mtime, cache_path):
+    """Гейт инвалидации кэша OCR картинок docx: mtime(docx) позже mtime кэша → кэш
+    недействителен (пересохранение docx с тех же именами картинок; вечный re-OCR лечится
+    детерминированным temp, который пишется один раз)."""
+    try:
+        if not os.path.exists(cache_path):
+            return False
+        return os.path.getmtime(cache_path) >= docx_mtime
+    except Exception:
+        return False
+
+
+def _docx_image_manifest(filepath):
+    """Упорядоченный манифест распознаваемых картинок docx. Возвращает dict:
+    {"images": [(zip_name, media_name)], "skipped_fmt": K, "small": S, "huge": H} —
+    только .png/.jpg/.jpeg ≥ DOCX_VISION_MIN_BYTES и ≤ DOCX_VISION_MAX_BYTES_PER_IMAGE,
+    порядок по appearance в document.xml (r:embed + word/_rels/document.xml.rels),
+    fallback на порядок namelist(). Дедуп по zip_name (повторы r:embed на одну media).
+    Ошибка zip → пустой манифест (верхний уровень отдаёт свою штатную ошибку)."""
+    manifest = {"images": [], "skipped_fmt": 0, "small": 0, "huge": 0}
+    try:
+        import zipfile
+        with zipfile.ZipFile(filepath) as zf:
+            infos = {i.filename: i for i in zf.infolist()}
+            rel_targets = {}
+            try:
+                with zf.open("word/_rels/document.xml.rels") as f:
+                    rels_root = ET.fromstring(f.read())
+                for rel in rels_root:
+                    if rel.get("TargetMode") == "External":
+                        continue
+                    rel_targets[rel.get("Id")] = (rel.get("Target") or "").replace("\\", "/").lstrip("/")
+            except Exception:
+                rel_targets = {}
+
+            def _zip_name_from_target(target):
+                target = (target or "").replace("\\", "/").lstrip("/")
+                if target.lower().startswith("word/"):
+                    return target
+                return "word/" + target
+
+            r_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+            ordered = []
+            try:
+                with zf.open("word/document.xml") as f:
+                    doc_root = ET.fromstring(f.read())
+                for el in doc_root.iter():
+                    rid = el.get(f"{{{r_ns}}}embed")
+                    if not rid:
+                        continue
+                    target = rel_targets.get(rid)
+                    if target:
+                        ordered.append(_zip_name_from_target(target))
+            except Exception:
+                ordered = []
+            if not ordered:
+                ordered = [i.filename for i in zf.infolist()
+                           if i.filename.lower().startswith("word/media/")]
+
+            seen = set()
+            images = []
+            skipped_fmt = 0
+            small = 0
+            huge = 0
+            for zip_name in ordered:
+                if zip_name in seen:
+                    continue
+                seen.add(zip_name)
+                info = infos.get(zip_name)
+                if info is None:
+                    continue
+                ext = os.path.splitext(zip_name)[1].lower()
+                if ext not in ('.png', '.jpg', '.jpeg'):
+                    skipped_fmt += 1
+                    continue
+                if info.file_size < DOCX_VISION_MIN_BYTES:
+                    small += 1
+                    continue
+                if info.file_size > DOCX_VISION_MAX_BYTES_PER_IMAGE:
+                    huge += 1
+                    continue
+                images.append((zip_name, os.path.basename(zip_name)))
+            manifest["images"] = images
+            manifest["skipped_fmt"] = skipped_fmt
+            manifest["small"] = small
+            manifest["huge"] = huge
+    except Exception:
+        pass
+    return manifest
+
+
+def _format_docx_media_block(media_name, ocr_text):
+    """Блок распознанной картинки docx — формат по образцу XWiki-MEDIA:
+    «> [!MEDIA] Иллюстрация из файла <имя> (docx):\n> <текст>». Служебный заголовок
+    роутера «--- РАСПОЗНАНО ИЗ ... ---» срезается; блок обрезается до DOCX_VISION_MAX_BLOCK_CHARS."""
+    text = (ocr_text or "").strip()
+    if text.startswith(_DOCVISION_MEDIA_PREFIX):
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1:].strip()
+    if len(text) > DOCX_VISION_MAX_BLOCK_CHARS:
+        text = text[:DOCX_VISION_MAX_BLOCK_CHARS] + "…(обрезано)"
+    if not text:
+        text = "(нет распознанного текста)"
+    return "> [!MEDIA] Иллюстрация из файла " + str(media_name) + " (docx):\n" + "> " + text.replace("\n", "\n> ")
+
+
+def _append_docx_vision_blocks(filepath):
+    """OCR картинок, встроенных в docx (v2.5.0). Возвращает кортеж
+    (blocks_text, total, ocr_ok, failed, skipped_fmt, small): blocks_text — блоки [!MEDIA]
+    плюс сводка остатка (или ""). Капы: docx_vision_max_images_per_file (0 = выкл.),
+    окно _DOCVISION_WINDOW (общее для синка и вложений), блок ≤ DOCX_VISION_MAX_BLOCK_CHARS,
+    сумма ≤ DOCX_VISION_MAX_TOTAL_CHARS. Сводка при M < N:
+    [Системная метка: в docx N изображений; распознано M (лимит файла L ...); не распознано
+    R (сбой/бюджет); пропущено форматов K, мелких S]. Инвариант синка (вечный ретрай текстов,
+    начинающихся с «Ошибка»): блоки и сводка так не начинаются; строки-сбои роутера тоже
+    считаются в failed. Helper никогда не роняет чтение docx (свой try/except)."""
+    empty = ("", 0, 0, 0, 0, 0)
+    try:
+        file_limit = _docx_vision_enabled()
+        if file_limit <= 0:
+            return empty
+        docx_abs = os.path.abspath(filepath)
+        docx_mtime = os.path.getmtime(docx_abs)
+        manifest = _docx_image_manifest(docx_abs)
+        images = manifest.get("images", []) or []
+        skipped_fmt = int(manifest.get("skipped_fmt", 0))
+        small = int(manifest.get("small", 0))
+        huge = int(manifest.get("huge", 0))
+        total = len(images)
+        if total == 0:
+            return empty
+
+        blocks = []
+        total_chars = 0
+        ocr_ok = 0
+        failed = 0
+        cached_hits = 0
+        budget_cut = False
+        circuit_cut = False
+        file_cap_rest = 0
+        text_caps_rest = 0
+        text_truncated = False
+
+        def _add_block(media_name, ocr_text):
+            nonlocal total_chars, text_truncated, text_caps_rest
+            block = _format_docx_media_block(media_name, ocr_text)
+            if total_chars + len(block) > DOCX_VISION_MAX_TOTAL_CHARS:
+                allowed = DOCX_VISION_MAX_TOTAL_CHARS - total_chars
+                if allowed > 40:
+                    blocks.append(block[:allowed - 1] + "\n> …(усечено по лимиту текста)")
+                text_truncated = True
+                text_caps_rest = total - ocr_ok - failed
+                return False
+            total_chars += len(block)
+            blocks.append(block)
+            return True
+
+        for zip_name, media_name in images:
+            if ocr_ok >= file_limit:
+                file_cap_rest = total - ocr_ok - failed
+                break
+            temp_path = _docx_media_temp_path(filepath, zip_name)
+            cache_path = _vision_cache_path(temp_path)
+            ocr_text = None
+            from_cache = False
+            if _docx_vision_cache_fresh(docx_mtime, cache_path):
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        ocr_text = f.read()
+                    if ocr_text and ocr_text.strip().startswith("Ошибка"):
+                        ocr_text = None
+                except Exception:
+                    ocr_text = None
+                from_cache = ocr_text is not None
+            if from_cache:
+                ocr_ok += 1
+                cached_hits += 1
+                if not _add_block(media_name, ocr_text):
+                    break
+                continue
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+            except Exception:
+                pass
+            if _VISION_CIRCUIT["open"]:
+                circuit_cut = True
+                failed += total - ocr_ok - failed
+                break
+            if not _docvision_allow_call():
+                budget_cut = True
+                failed += total - ocr_ok - failed
+                break
+            temp_path = _extract_docx_media_temp(filepath, zip_name)
+            if not temp_path:
+                failed += 1
+                continue
+            try:
+                ocr_text = extract_smart_vision_and_pdf(temp_path)
+            except VisionAPIError:
+                failed += 1
+                if _VISION_CIRCUIT["open"]:
+                    circuit_cut = True
+                    failed += total - ocr_ok - failed
+                    break
+                continue
+            if ocr_text and ocr_text.strip().startswith("Ошибка"):
+                failed += 1
+                continue
+            ocr_ok += 1
+            if not _add_block(media_name, ocr_text):
+                break
+
+        blocks_text = "\n\n".join(blocks)
+        if ocr_ok < total:
+            extras = "(лимит файла " + str(file_limit)
+            if budget_cut:
+                extras += ", бюджет раунда"
+            if circuit_cut:
+                extras += ", цепь сбоев"
+            if file_cap_rest > 0:
+                extras += ", за капом " + str(file_cap_rest)
+            if text_caps_rest > 0:
+                extras += ", по лимиту текста " + str(text_caps_rest)
+            if text_truncated:
+                extras += ", текст усечен"
+            extras += ")"
+            summary = ("[Системная метка: в docx " + str(total) + " изображений; распознано "
+                       + str(ocr_ok) + " " + extras + "; не распознано " + str(failed)
+                       + " (сбой/бюджет); пропущено форматов " + str(skipped_fmt) + ", мелких " + str(small)
+                       + (", крупных " + str(huge) if huge else "") + "]")
+            blocks_text = (blocks_text + "\n\n" + summary) if blocks_text else summary
+        try:
+            log_core.info("Vision docx %s: распознано %d/%d (сбои %d, кэш %d)",
+                          os.path.basename(filepath), ocr_ok, total, failed, cached_hits)
+        except Exception:
+            pass
+        return (blocks_text, total, ocr_ok, failed, skipped_fmt, small)
+    except Exception as e:
+        try:
+            log_core.warning("Vision docx %s: OCR-блоки не добавлены (%s)",
+                             os.path.basename(str(filepath)) if filepath else "?", e)
+        except Exception:
+            pass
+        return empty
+
+
 def _parse_vision_page_markers(text):
     """Разбор постраничного vision-кэша по маркерам «--- Страница N (Vision OCR|Native Text) ---».
     Возвращает {номер_страницы: текстовый_блок_целиком_с_маркером}.
@@ -3595,7 +3918,15 @@ def _read_file_content_by_path(target_file, filename):
         if ext.endswith('.txt') or ext.endswith('.md'):
             with open(target_file, 'r', encoding='utf-8') as f: return f.read()
         elif ext.endswith('.docx'):
-            return read_docx_with_indices(target_file)[0]
+            base_text = read_docx_with_indices(target_file)[0]
+            if isinstance(base_text, str) and _docx_vision_enabled():
+                try:
+                    blocks_text = _append_docx_vision_blocks(target_file)[0]
+                    if blocks_text:
+                        base_text += "\n\n--- Изображения документа (Vision OCR) ---\n" + blocks_text
+                except Exception:
+                    log_core.warning("Vision docx %s: OCR-блоки не добавлены — чтение продолжено без них", os.path.basename(target_file))
+            return base_text
         elif ext.endswith(('.doc', '.rtf')):
             # Используем безопасную локальную песочницу
             text_content = safe_read_old_word_file(target_file)
@@ -6235,6 +6566,7 @@ DEFAULT_GLOBAL_SETTINGS = {
     "chroma_batch_size": 100,
     "xwiki_urls": [],
     "xwiki_spider_depth": 0,
+    "docx_vision_max_images_per_file": 30,
     "graph_rag_enabled": False,
     "graph_rag_model": "deepseek/deepseek-v4-flash-0731",
     "graph_rag_delay": 60,
@@ -6289,10 +6621,14 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.4.1 Enterprise"
+APP_VERSION = "v2.5.0 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
+    "2.5.0 - Vision-распознавание картинок, встроенных в docx: схемы и блок-схемы из Word "
+    "попадают в базу знаний и чат; лимит картинок на файл за проход (ползунок на вкладке "
+    "XWiki, 0 = выключено), кэш распознавания, общий бюджет 60 вызовов/10 минут, защита "
+    "от каскада; большие Word >100k символов идут без OCR.\n"
     "2.4.1 - Дельта-выгрузка базы на сервер: robocopy /MIR в постоянную папку .staging "
     "(переносится только изменившееся, \"призраки\" purge'ятся), живой снапшот graph_rag.db "
     "инъекцией целиком, атомарная замена с переиспользованием старой выгрузки как базы "
@@ -6300,10 +6636,6 @@ APP_DESCRIPTION = (
     "2.4.0 - Разделение синхронизации: быстрая кнопка «Синхронизировать базу» (только папки) и "
     "кнопка «Синхронизировать XWiki» (полный цикл: XWiki + база + выгрузка); единая модульная "
     "защита от одновременного запуска синхронизации.\n"
-    "2.3.1 - Ползунок «Глубина паучьей догрузки» на вкладке XWiki (0–5, дефолт 0): 0 — паучья "
-    "догрузка выключена (индексируются только discovery-цели), 1–5 — догрузка до N переходов "
-    "(свою вику тоже ограничивает), кросс-вики — только на вики из списка target'ов; проверки "
-    "диагностики паука с счётчиком отказа по лимиту глубины.\n"
     "Полная история изменений: docs/DECISIONS.md.\n"
     "\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
@@ -8271,7 +8603,7 @@ class App(ctk.CTk):
                 os.makedirs(cache_dir, exist_ok=True)
 
                 # Действие пользователя: не наследуем цепь сбоев Vision от параллельного синка
-                if any(os.path.splitext(fp)[1].lower() in ('.pdf', '.jpg', '.jpeg', '.png', '.bmp') for fp in file_paths):
+                if any(os.path.splitext(fp)[1].lower() in ('.pdf', '.jpg', '.jpeg', '.png', '.bmp', '.docx') for fp in file_paths):
                     _vision_circuit_reset()
 
                 # 3. ГЛАВНЫЙ ЦИКЛ ОБРАБОТКИ
@@ -8280,6 +8612,7 @@ class App(ctk.CTk):
                         ext = os.path.splitext(file_path)[1].lower()
                         text_content = ""
                         comments_count, comments_block = 0, None  # D-2026-09-20-05
+                        docx_media_guard = None  # v2.5.0: hash6 docx для skip vision-кэшей картинок
                         
                         # --- СНИМОК ДО ПАРСИНГА И БАЗОВОЕ ИМЯ ---
                         cache_snapshot_before = set(os.listdir(cache_dir)) if os.path.exists(cache_dir) else set()
@@ -8296,6 +8629,7 @@ class App(ctk.CTk):
                             text_content = extract_text_from_html_diagram(file_path)
                             
                         elif ext == '.docx':
+                            docx_media_guard = hashlib.md5(os.path.abspath(file_path).encode("utf-8")).hexdigest()[:6]
                             parsed_raw = read_docx_with_indices(file_path)
                             # Защита от Tuple
                             text_content = parsed_raw[0] if isinstance(parsed_raw, tuple) else parsed_raw
@@ -8303,6 +8637,13 @@ class App(ctk.CTk):
                             comments_count, comments_block = _extract_docx_comments(
                                 file_path,
                                 paras=parsed_raw[1] if isinstance(parsed_raw, tuple) else None)
+                            if docx_text_len <= 100000 and isinstance(text_content, str) and _docx_vision_enabled():
+                                try:
+                                    blocks_text = _append_docx_vision_blocks(file_path)[0]
+                                    if blocks_text:
+                                        text_content += "\n\n--- Изображения документа (Vision OCR) ---\n" + blocks_text
+                                except Exception as ve_err:
+                                    _warn_attach_skip(f"Vision docx {os.path.basename(file_path)}: OCR-блоки не добавлены ({ve_err})")
                             if docx_text_len > 100000:
                                 text_content = (
                                     f"Пользователь прикрепил большой Word файл (.docx) по пути: {os.path.abspath(file_path)}. "
@@ -8421,6 +8762,10 @@ class App(ctk.CTk):
                                 # СНАЙПЕРСКИЙ ФИЛЬТР: Удаляем только если имя оригинального файла есть в названии мусорного,
                                 # либо если это наш собственный сгенерированный converted_ файл для Word.
                                 if original_base_name in side_effect_file or "converted_" in side_effect_file:
+                                    # v2.5.0: vision-кэш картинки docx (name = <hash6_docx>_<media>_<hash6>_vision.md)
+                                    # — легитимный артефакт, не мусор: не удаляем свежий OCR вложения
+                                    if docx_media_guard and side_effect_file.startswith(docx_media_guard + "_") and side_effect_file.endswith("_vision.md"):
+                                        continue
                                     file_to_remove = os.path.join(cache_dir, side_effect_file)
                                     try:
                                         if os.path.isfile(file_to_remove):
@@ -10241,6 +10586,21 @@ class App(ctk.CTk):
         if not is_admin:
             xwiki_depth_slider.configure(state="disabled")
 
+        # --- v2.5.0 (Батч D): лимит Vision-картинок docx за проход (АДМИН) ---
+        ctk.CTkLabel(tab_xwiki, text="Лимит Vision-картинок docx за проход (0 = выкл.):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0), anchor="w", padx=30)
+        ctk.CTkLabel(tab_xwiki, text="0 — распознавание картинок, встроенных в docx (схемы, блок-схемы), выключено.\n"
+                                     "1–100 — максимум картинок на файл за один проход; недораспознанный\n"
+                                     "остаток добирается повторным чтением/проходом (кэш делает их бесплатными).",
+                     font=ctk.CTkFont(size=12), text_color="gray").pack(pady=(2, 5), anchor="w", padx=30)
+        self.docx_vision_limit_var = ctk.DoubleVar(value=float(self.global_settings.get("docx_vision_max_images_per_file", 30)))
+        docx_vision_limit_slider = ctk.CTkSlider(tab_xwiki, from_=0, to=100, number_of_steps=10, variable=self.docx_vision_limit_var, width=300)
+        docx_vision_limit_slider.pack(pady=(5, 0), anchor="w", padx=30)
+        docx_vision_limit_label = ctk.CTkLabel(tab_xwiki, text=str(int(self.docx_vision_limit_var.get())))
+        docx_vision_limit_label.pack(pady=(0, 10), anchor="w", padx=30)
+        docx_vision_limit_slider.configure(command=lambda v: docx_vision_limit_label.configure(text=str(int(v))))
+        if not is_admin:
+            docx_vision_limit_slider.configure(state="disabled")
+
         # --- ВКЛАДКА: НАСТРОЙКИ EXCEL ---
         ctk.CTkLabel(tab_excel, text="Порог ячеек (CSV → Code Interpreter):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0), anchor="w", padx=30)
         ctk.CTkLabel(tab_excel, text="Если ячеек меньше порога — файл конвертируется в CSV.\nЕсли больше — используется Code Interpreter.", font=ctk.CTkFont(size=12), text_color="gray").pack(pady=(2, 5), anchor="w", padx=30)
@@ -10468,6 +10828,12 @@ class App(ctk.CTk):
                         self.global_settings["xwiki_spider_depth"] = max(0, min(5, int(self.xwiki_spider_depth_var.get())))
                     except Exception:
                         self.global_settings["xwiki_spider_depth"] = 0
+                # Лимит Vision-картинок docx (v2.5.0, Батч D) — только Админ (блок is_admin)
+                if hasattr(self, "docx_vision_limit_var"):
+                    try:
+                        self.global_settings["docx_vision_max_images_per_file"] = max(0, min(100, int(self.docx_vision_limit_var.get())))
+                    except Exception:
+                        self.global_settings["docx_vision_max_images_per_file"] = 30
 
                 # 3.2 Сохранение настроек Excel
                 try:
