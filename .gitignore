@@ -39,3 +39,7 @@ soak_crash.log
 
 # Скрипт-тесты (верификация планов) — остаются локально, на GitHub не выкладываются
 scripts/test_*.py
+# Артефакты rename-фазы дельта-выгрузки v2.4.1 (staging + осиротевшие .old/.tmp после сбоев)
+smk_vector_db.staging/
+smk_vector_db.old_*/
+smk_vector_db.tmp_*/

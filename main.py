@@ -4031,34 +4031,145 @@ def _push_db_to_server(self, local_db, server_db):
         if not have_snapshot:
             raise RuntimeError("Не удалось получить снапшот graph_rag.db за 3 попытки")
 
-    # 3) Копия во временную папку рядом с серверной (тот же том — rename работает).
-    # graph_rag.db* не берём из живой папки — положим снапшот сами.
+    # 3) Дельта-зеркалирование через staging ({server_db}.staging — соседняя папка, тот же
+    # том, rename работает). Staging хранит содержимое последней успешной выгрузки;
+    # robocopy /MIR переносит только изменившееся (mtime+size), исчезнувшее purge'ит.
+    # graph_rag.db* в зеркало не входит — свежий снапшот инъектируется отдельно (всегда
+    # целиком, рассинхрона графа не бывает). После копирования staging атомарно
+    # переименовывается в live (шаг 4), а прежний live становится staging'ом следующей
+    # дельты. Ручное удаление staging безопасно — следующий пуш сделает полный seed.
+    staging_db = f"{server_db}.staging"
     tmp_db = f"{server_db}.tmp_{os.getpid()}"
     old_db = f"{server_db}.old_{os.getpid()}"
     shutil.rmtree(tmp_db, ignore_errors=True)
     shutil.rmtree(old_db, ignore_errors=True)
-    try:
-        shutil.copytree(local_db, tmp_db,
-                        ignore=shutil.ignore_patterns("graph_rag.db", "graph_rag.db-wal", "graph_rag.db-shm"))
-    except shutil.Error as copy_err:
-        # Исчезновение -wal/-shm НЕ фатально: сайдкары удаляются только после чекпоинта,
-        # т.е. их содержимое уже слито в основной файл. Любая другая потеря — фатальна.
-        fatal = [e for e in copy_err.args[0] if not str(e[0]).endswith(("-wal", "-shm"))]
-        if fatal:
-            shutil.rmtree(tmp_db, ignore_errors=True)
-            raise
-        log_sync.warning("Выгрузка БД: WAL-сайдкары исчезли при копировании (%d шт.) — скопировано без них",
-                         len(copy_err.args[0]))
-    if have_snapshot:
-        shutil.copy2(snapshot_path, os.path.join(tmp_db, "graph_rag.db"))
-        os.remove(snapshot_path)
 
-    # 4) Атомарная замена: live -> .old, tmp -> live; при сбое откат .old на место.
+    copy_ignore = shutil.ignore_patterns("graph_rag.db", "graph_rag.db-wal", "graph_rag.db-shm")
+
+    def _inject_snapshot(dst_db):
+        # graph_rag.db кладём ТОЛЬКО снапшотом. Defensive-очистка graph_rag.db* в staging:
+        # семантика /XF + /PURGE для исключённого файла неоднозначна — удаляем принудительно.
+        # Здесь на момент вызова snapshot_path гарантированно существует (have_snapshot);
+        # при have_snapshot=False в базе вообще не было graph_rag.db — инъекции нет.
+        if not have_snapshot:
+            return
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                dp = os.path.join(dst_db, f"graph_rag.db{suffix}")
+                if os.path.exists(dp):
+                    os.remove(dp)
+            except Exception:
+                pass
+        shutil.copy2(snapshot_path, os.path.join(dst_db, "graph_rag.db"))
+        os.remove(snapshot_path)
+        # Корень dst: создание graph_rag.db бампает mtime корня; robocopy тогда на
+        # КАЖДОЙ следующей выгрузке «переносит» сам корень (rc-бит 1 без файлов).
+        # Возвращаем mtime корня под локальный — пустой прогон остаётся rc=0.
+        try:
+            t = os.path.getmtime(local_db)
+            os.utime(dst_db, (t, t))
+        except Exception:
+            pass
+
+    def _full_copytree_to(dst_db):
+        # Полный проход прежней копировалкой (legacy-ветка и самовосстановление staging).
+        try:
+            shutil.copytree(local_db, dst_db, ignore=copy_ignore)
+        except shutil.Error as copy_err:
+            # Исчезновение -wal/-shm НЕ фатально: сайдкары удаляются только после чекпоинта,
+            # т.е. их содержимое уже слито в основной файл. Любая другая потеря — фатальна.
+            fatal = [e for e in copy_err.args[0] if not str(e[0]).endswith(("-wal", "-shm"))]
+            if fatal:
+                shutil.rmtree(dst_db, ignore_errors=True)
+                raise
+            log_sync.warning("Выгрузка БД: WAL-сайдкары исчезли при копировании (%d шт.) — скопировано без них",
+                             len(copy_err.args[0]))
+
+    # 3а) Guard аномалии staging: если у общего файла время изменения в staging НОВЕЕ
+    # локального — плоская дельта недостоверна (ручной откат копии базы назад по времени
+    # или оборванный файл от краша robocopy: свежий mtime записи). Лечение — полный
+    # проход: rmtree(staging) + прежняя копировалка. graph_rag.db* из сравнения
+    # исключены: в staging они всегда свежее локальной живой базы (инъекция снапшота).
+    robo_path = shutil.which("robocopy")
+    staging_anomaly = False
+    if robo_path and os.path.isdir(staging_db):
+        try:
+            for root, _dirs, files in os.walk(local_db):
+                if staging_anomaly:
+                    break
+                for fname in files:
+                    if fname.startswith("graph_rag.db"):
+                        continue
+                    src = os.path.join(root, fname)
+                    dst = os.path.join(staging_db, os.path.relpath(os.path.join(root, fname), local_db))
+                    try:
+                        if os.path.exists(dst) and os.path.getmtime(src) < os.path.getmtime(dst):
+                            staging_anomaly = True
+                            break
+                    except OSError:
+                        continue
+        except OSError as g_err:
+            log_sync.warning("Выгрузка БД: не удалось сверить staging-копию (%s) — используем полный проход", g_err)
+            staging_anomaly = True
+    if staging_anomaly:
+        log_sync.warning("Выгрузка БД: staging подозрителен (более свежие файлы, чем в локальной базе) "
+                         "— полный проход с пересборкой staging")
+        shutil.rmtree(staging_db, ignore_errors=True)
+        _full_copytree_to(staging_db)
+        _inject_snapshot(staging_db)
+    elif robo_path:
+        # 3б) Нормальный путь: дельта robocopy /MIR в staging. Код выхода — бит-маска:
+        # успех = (rc & 8) == 0; при серьёзном сбое — один полный повтор (staging уже
+        # содержит докопанное, повтор докачивает только недописанное).
+        args = [robo_path, os.path.abspath(local_db), os.path.abspath(staging_db),
+                "/MIR", "/XF", "graph_rag.db", "graph_rag.db-wal", "graph_rag.db-shm",
+                "/MT:16", "/R:2", "/W:2", "/NP", "/NFL", "/NDL"]
+        rc_ok = False
+        t_copy = time.time()
+        for robo_attempt in (1, 2):
+            try:
+                proc = subprocess.run(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                      timeout=3600, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                rc = proc.returncode
+                out_tail = ""
+                if rc & 8:
+                    out_tail = (proc.stdout.decode("oem", errors="replace").rstrip() or "")[-500:]
+                    log_sync.warning("Выгрузка БД: robocopy попытка %d вернула код %d%s",
+                                     robo_attempt, rc, f":\n{out_tail}" if out_tail else "")
+                else:
+                    log_sync.info("Выгрузка БД: дельта robocopy завершена за %.1f с (код %d)",
+                                  time.time() - t_copy, rc)
+                    rc_ok = True
+                    break
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("Выгрузка БД: robocopy не уложился в 3600 с — выгрузка отменена, "
+                                   "серверная база не тронута")
+        if not rc_ok:
+            raise RuntimeError(f"Выгрузка БД: robocopy дважды завершился с ошибкой (код {rc}) "
+                               f"— серверная база не тронута:\n{out_tail}")
+        _inject_snapshot(staging_db)
+    else:
+        # Legacy: robocopy недоступен — функциональность не деградирует, но staging
+        # пересдаётся целиком копировалкой.
+        log_sync.warning("Выгрузка БД: robocopy не найден — полная копия (без дельты)")
+        if os.path.exists(staging_db) and not os.path.isdir(staging_db):
+            try:
+                os.remove(staging_db)
+            except Exception:
+                pass
+        shutil.rmtree(staging_db, ignore_errors=True)
+        _full_copytree_to(staging_db)
+        _inject_snapshot(staging_db)
+
+    # 4) Атомарная замена: live -> .old, staging -> live; при сбое откат .old на место.
+    # Старый live переиспользуется: rename .old -> staging даёт следующему пушу базу дельты;
+    # если переименование не удалось или live отсутствовал (первый пуш) — обычная уборка,
+    # следующий пуш пересобирает staging полным seed'ом (самовосстановление).
     try:
         if os.path.exists(server_db):
             os.rename(server_db, old_db)
         try:
-            os.rename(tmp_db, server_db)
+            os.rename(staging_db, server_db)
         except Exception:
             if os.path.exists(old_db) and not os.path.exists(server_db):
                 try:
@@ -4067,9 +4178,16 @@ def _push_db_to_server(self, local_db, server_db):
                     log_sync.error("Откат выгрузки не удался — прежняя база лежит в %s", old_db)
             raise
     except Exception:
-        shutil.rmtree(tmp_db, ignore_errors=True)
+        # staging при откате мог остаться на месте — не трогаем: следующий пуш сверит
+        # его guard'ом (3а) и восстановит целостность.
         raise
-    shutil.rmtree(old_db, ignore_errors=True)
+    if os.path.isdir(old_db):
+        try:
+            os.rename(old_db, staging_db)
+        except Exception:
+            shutil.rmtree(old_db, ignore_errors=True)
+            log_sync.warning("Выгрузка БД: не удалось переиспользовать прежнюю базу как staging — "
+                             "следующая выгрузка пройдёт полной копией")
 
 
 # Модульный guard синхронизации: единственный запуск на процесс — покрывает все 7 точек
@@ -4297,7 +4415,7 @@ def sync_vector_db(self=None, run_xwiki=True):
                 _push_db_to_server(self, local_db, server_db)
                 client = chromadb.PersistentClient(path=local_db)
                 collection = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
-                log_sync.info("Выгрузка БД на сервер: ок (graph_rag.db — снапшот backup, замена через .tmp/.old)")
+                log_sync.info("Выгрузка БД на сервер: ок (graph_rag.db — снапшот backup, дельта robocopy в staging, замена через .staging/.old)")
             except Exception as e:
                 log_sync.error("Ошибка выгрузки БД на сервер (серверная база не тронута): %s", e)
 
@@ -6171,10 +6289,14 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.4.0 Enterprise"
+APP_VERSION = "v2.4.1 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
+    "2.4.1 - Дельта-выгрузка базы на сервер: robocopy /MIR в постоянную папку .staging "
+    "(переносится только изменившееся, \"призраки\" purge'ятся), живой снапшот graph_rag.db "
+    "инъекцией целиком, атомарная замена с переиспользованием старой выгрузки как базы "
+    "следующей дельты; самовосстановление при откате времени или битом staging.\n"
     "2.4.0 - Разделение синхронизации: быстрая кнопка «Синхронизировать базу» (только папки) и "
     "кнопка «Синхронизировать XWiki» (полный цикл: XWiki + база + выгрузка); единая модульная "
     "защита от одновременного запуска синхронизации.\n"
@@ -6182,8 +6304,6 @@ APP_DESCRIPTION = (
     "догрузка выключена (индексируются только discovery-цели), 1–5 — догрузка до N переходов "
     "(свою вику тоже ограничивает), кросс-вики — только на вики из списка target'ов; проверки "
     "диагностики паука с счётчиком отказа по лимиту глубины.\n"
-    "2.3.0 - Мультивики-синк XWiki: per-target URL (исправление 151×404), страницы с двоеточием "
-    "в пространстве, строгая изоляция вики паука, диагностика паука.\n"
     "Полная история изменений: docs/DECISIONS.md.\n"
     "\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
