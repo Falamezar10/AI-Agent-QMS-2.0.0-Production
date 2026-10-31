@@ -5246,6 +5246,33 @@ def search_wikipedia_tool(query):
     except Exception as e:
         return f"Ошибка поиска в Википедии: {str(e)}"
 
+def reindex_memory_file(memory_file=None):
+    """Переиндексация Memory/agent_memory.md в Chroma: delete всех чанков файла + upsert заново.
+
+    Общий код для инструментов памяти (memorize_important_fact/forget_fact) и GUI-редактора.
+    Возвращает статус-строку («Память переиндексирована (N чанков).»); при ошибке бросает
+    исключение наверх — вызывающие решают, какую ошибку показать (у инструментов свои
+    прежние тексты ошибок)."""
+    if memory_file is None:
+        memory_dir = os.path.join(get_base_path(), "Memory")
+        os.makedirs(memory_dir, exist_ok=True)
+        memory_file = os.path.join(memory_dir, "agent_memory.md")
+
+    client = chromadb.PersistentClient(path=get_db_path())
+    collection = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
+    collection.delete(where={"file_path": memory_file})
+
+    with open(memory_file, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    chunks = chunk_text(text)
+    if chunks:
+        ids = [f"{memory_file}_chunk_{j}" for j in range(len(chunks))]
+        metadatas = [{"source": "agent_memory.md", "file_path": memory_file} for _ in chunks]
+        collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
+
+    return f"Память переиндексирована ({len(chunks)} чанков)."
+
 def memorize_important_fact(fact):
     try:
         memory_dir = os.path.join(get_base_path(), "Memory")
@@ -5256,18 +5283,7 @@ def memorize_important_fact(fact):
             with open(memory_file, "w", encoding="utf-8") as f: f.write("# Долгосрочная память ИИ-Агента\n\n")
         with open(memory_file, "a", encoding="utf-8") as f: f.write(f"- [{date_str}] {fact}\n")
 
-        client = chromadb.PersistentClient(path=get_db_path())
-        collection = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
-        collection.delete(where={"file_path": memory_file})
-
-        with open(memory_file, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        chunks = chunk_text(text)
-        if chunks:
-            ids = [f"{memory_file}_chunk_{j}" for j in range(len(chunks))]
-            metadatas = [{"source": "agent_memory.md", "file_path": memory_file} for _ in chunks]
-            collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
+        reindex_memory_file(memory_file)
 
         return f"Факт успешно сохранен и проиндексирован."
     except Exception as e: return f"Ошибка памяти: {str(e)}"
@@ -5284,18 +5300,7 @@ def forget_fact(query):
         new_lines = [line for line in lines if line_to_delete not in line]
         with open(memory_file, "w", encoding="utf-8") as f: f.writelines(new_lines)
 
-        client = chromadb.PersistentClient(path=get_db_path())
-        collection = client.get_or_create_collection(name="smk_docs", embedding_function=get_cloud_ef())
-        collection.delete(where={"file_path": memory_file})
-
-        with open(memory_file, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        chunks = chunk_text(text)
-        if chunks:
-            ids = [f"{memory_file}_chunk_{j}" for j in range(len(chunks))]
-            metadatas = [{"source": "agent_memory.md", "file_path": memory_file} for _ in chunks]
-            collection.upsert(documents=chunks, ids=ids, metadatas=metadatas)
+        reindex_memory_file(memory_file)
 
         return f"Факт удален."
     except Exception as e: return f"Ошибка удаления: {str(e)}"
@@ -6289,10 +6294,13 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.4.1 Enterprise"
+APP_VERSION = "v2.4.2 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
+    "2.4.2 - Кнопка \"Управление памятью\" (админ): визуальное редактирование Memory/agent_memory.md "
+    "с мгновенной переиндексацией, добавление фактов с автодатой, страховочные копии; общая "
+    "переиндексация вынесена в reindex_memory_file (инструменты памяти переведены на хелпер).\n"
     "2.4.1 - Дельта-выгрузка базы на сервер: robocopy /MIR в постоянную папку .staging "
     "(переносится только изменившееся, \"призраки\" purge'ятся), живой снапшот graph_rag.db "
     "инъекцией целиком, атомарная замена с переиспользованием старой выгрузки как базы "
@@ -6300,10 +6308,6 @@ APP_DESCRIPTION = (
     "2.4.0 - Разделение синхронизации: быстрая кнопка «Синхронизировать базу» (только папки) и "
     "кнопка «Синхронизировать XWiki» (полный цикл: XWiki + база + выгрузка); единая модульная "
     "защита от одновременного запуска синхронизации.\n"
-    "2.3.1 - Ползунок «Глубина паучьей догрузки» на вкладке XWiki (0–5, дефолт 0): 0 — паучья "
-    "догрузка выключена (индексируются только discovery-цели), 1–5 — догрузка до N переходов "
-    "(свою вику тоже ограничивает), кросс-вики — только на вики из списка target'ов; проверки "
-    "диагностики паука с счётчиком отказа по лимиту глубины.\n"
     "Полная история изменений: docs/DECISIONS.md.\n"
     "\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
@@ -6521,8 +6525,8 @@ class App(ctk.CTk):
         
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        # Делаем 4-ю строку резиновой, чтобы прижать нижние элементы
-        self.sidebar_frame.grid_rowconfigure(4, weight=1)
+        # Делаем 5-ю строку резиновой, чтобы прижать нижние элементы
+        self.sidebar_frame.grid_rowconfigure(5, weight=1)
         
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="ИИ-Агент СМК", font=ctk.CTkFont(size=20, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
@@ -6536,6 +6540,14 @@ class App(ctk.CTk):
         self.btn_history = ctk.CTkButton(self.sidebar_frame, text="📚 История диалогов", command=self.open_history_window)
         self.btn_history.grid(row=3, column=0, padx=20, pady=10)
 
+        # v2.4.2: редактор файловой памяти агента (admin; гейт видимости — в update_ui_for_role)
+        self.memory_btn = ctk.CTkButton(
+            self.sidebar_frame,
+            text="🧠 Управление памятью",
+            command=self.open_memory_manager
+        )
+        self.memory_btn.grid(row=4, column=0, padx=20, pady=10)
+
         self.export_btn = ctk.CTkButton(
             self.sidebar_frame,
             text="💾 Экспорт в Word", 
@@ -6543,7 +6555,7 @@ class App(ctk.CTk):
             fg_color="#2E7D32",
             hover_color="#1B5E20"
         )
-        self.export_btn.grid(row=4, column=0, padx=20, pady=10)
+        self.export_btn.grid(row=5, column=0, padx=20, pady=10)
 
         self.auth_btn = ctk.CTkButton(
             self.sidebar_frame,
@@ -6552,7 +6564,7 @@ class App(ctk.CTk):
             fg_color="#455A64",
             hover_color="#263238"
         )
-        self.auth_btn.grid(row=5, column=0, padx=20, pady=(10, 0), sticky="s")
+        self.auth_btn.grid(row=6, column=0, padx=20, pady=(10, 0), sticky="s")
         
         # --- Тумблер автономного чтения ---
         def toggle_auto_read():
@@ -6566,7 +6578,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=toggle_auto_read
         )
-        self.auto_read_switch.grid(row=6, column=0, padx=20, pady=(15, 0), sticky="s")
+        self.auto_read_switch.grid(row=7, column=0, padx=20, pady=(15, 0), sticky="s")
         # ----------------------------------------
 
         # --- Тумблер глубокого аудита (Рефлексия) ---
@@ -6580,7 +6592,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=11),
             command=toggle_deep_audit
         )
-        self.deep_audit_switch.grid(row=7, column=0, padx=20, pady=(8, 0), sticky="s")
+        self.deep_audit_switch.grid(row=8, column=0, padx=20, pady=(8, 0), sticky="s")
         if self.current_settings.get("deep_audit_enabled", False):
             self.deep_audit_switch.select()
         else:
@@ -6595,18 +6607,18 @@ class App(ctk.CTk):
         self.update_ui_for_role()
 
         self.progress_bar = ctk.CTkProgressBar(self.sidebar_frame)
-        self.progress_bar.grid(row=8, column=0, padx=20, pady=(15, 4), sticky="ew")
+        self.progress_bar.grid(row=9, column=0, padx=20, pady=(15, 4), sticky="ew")
         self.progress_bar.set(0)
 
         self.file_progress_label = ctk.CTkLabel(self.sidebar_frame, text="Ожидание синхронизации", font=ctk.CTkFont(size=11))
-        self.file_progress_label.grid(row=9, column=0, padx=20, pady=(0, 6), sticky="w")
+        self.file_progress_label.grid(row=10, column=0, padx=20, pady=(0, 6), sticky="w")
 
         self.status_label = ctk.CTkLabel(self.sidebar_frame, text="Загрузка...", font=ctk.CTkFont(size=12))
-        self.status_label.grid(row=10, column=0, padx=20, pady=(5, 15))
+        self.status_label.grid(row=11, column=0, padx=20, pady=(5, 15))
 
         # Индикатор прогресса построения графа связей (обновляется фоновым пауком)
         self.graph_status_label = ctk.CTkLabel(self.sidebar_frame, text="", font=ctk.CTkFont(size=11), text_color="#8ab4f8")
-        self.graph_status_label.grid(row=11, column=0, padx=20, pady=(0, 10), sticky="w")
+        self.graph_status_label.grid(row=12, column=0, padx=20, pady=(0, 10), sticky="w")
         
         self.chat_frame = ctk.CTkFrame(self)
         self.chat_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
@@ -7634,6 +7646,12 @@ class App(ctk.CTk):
                 self.btn_history.grid()
             else:
                 self.btn_history.grid_remove()
+        # v2.4.2: кнопка «Управление памятью» — только для админа (инструменты памяти admin-only)
+        if hasattr(self, "memory_btn"):
+            if is_admin:
+                self.memory_btn.grid()
+            else:
+                self.memory_btn.grid_remove()
         if hasattr(self, "auth_btn"):
             self.auth_btn.configure(text="🔒 Выйти (Админ)" if is_admin else "🔑 Войти как Админ")
         # Обновляем видимость кнопки микрофона при смене роли
@@ -10566,6 +10584,227 @@ class App(ctk.CTk):
 
         save_btn = ctk.CTkButton(settings_window, text="Сохранить", command=save, fg_color="#2E7D32", hover_color="#1B5E20")
         save_btn.pack(pady=(10, 20))
+
+    # ==================== УПРАВЛЕНИЕ ПАМЯТЬЮ (v2.4.2) ====================
+    def open_memory_manager(self):
+        """Окно «Управление памятью» (админ): сплошной редактор Memory/agent_memory.md
+        с мгновенной переиндексацией, добавлением фактов с автодатой и страховочными копиями."""
+        # Антидубль: окно ещё открыто — поднимем существующее вместо создания нового
+        existing = getattr(self, "_memory_window", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            self._memory_window = None
+
+        memory_dir = os.path.join(get_base_path(), "Memory")
+        memory_file = os.path.join(memory_dir, "agent_memory.md")
+
+        win = ctk.CTkToplevel(self)
+        self._memory_window = win
+        win.title("Управление памятью агента")
+        win.geometry("920x640")
+        win.transient(self)
+
+        # Состояние окна: mtime файла на момент загрузки, снапшот текста, флаг двухшагового подтверждения
+        state = {"mtime": None, "snapshot": "", "confirm": None}
+
+        def _read_file_text():
+            if os.path.exists(memory_file):
+                with open(memory_file, "r", encoding="utf-8") as f:
+                    return f.read()
+            return "# Долгосрочная память ИИ-Агента\n\n"
+
+        textbox = ctk.CTkTextbox(win, wrap="word", font=ctk.CTkFont(size=13))
+        # Ctrl+Z — необязательный бонус: поддержка undo в CTkTextbox не гарантирована
+        try:
+            textbox.configure(undo=True)
+        except Exception:
+            pass
+
+        status_label = ctk.CTkLabel(win, text="", font=ctk.CTkFont(size=12), justify="left", anchor="w")
+
+        toolbar = ctk.CTkFrame(win, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=(10, 2))
+
+        toolbar2 = ctk.CTkFrame(win, fg_color="transparent")
+        toolbar2.pack(fill="x", padx=10, pady=(2, 2))
+        status_label.pack(fill="x", padx=10)
+        # Редактор — последним: pack уходит вниз и забирает всё остальное место
+        textbox.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+
+        def _set_status(msg, color=None):
+            if color:
+                status_label.configure(text=msg, text_color=color)
+            else:
+                status_label.configure(text=msg)
+            log_ui.info("Управление памятью: %s", msg)
+
+        def reload_from_file(initial=False):
+            """Загрузка/перезагрузка текста редактора из файла (правки сбрасываются)."""
+            try:
+                disk_text = _read_file_text()
+            except Exception as e:
+                _set_status(f"Ошибка чтения файла памяти: {e}", "#e06c75")
+                return
+            # Двухшаговое подтверждение: правки, не сохранённые в файл, будут потеряны
+            if not initial and textbox.get("1.0", "end-1c") != state["snapshot"]:
+                if state["confirm"] != "reload":
+                    state["confirm"] = "reload"
+                    _set_status("В редакторе есть несохранённые правки — перезагрузка их уничтожит. "
+                                "Нажмите «🔄 Перезагрузить» ещё раз для подтверждения.", "#e5c07b")
+                    return
+            state["confirm"] = None
+            textbox.configure(state="normal")
+            textbox.delete("1.0", "end")
+            textbox.insert("1.0", disk_text)
+            state["snapshot"] = disk_text
+            try:
+                state["mtime"] = os.path.getmtime(memory_file) if os.path.exists(memory_file) else None
+            except Exception:
+                state["mtime"] = None
+            _set_status("Редактор загружен из файла памяти.")
+
+        def add_fact():
+            fact = fact_entry.get().strip()
+            if not fact:
+                _set_status("Введите текст факта.", "#e5c07b")
+                return
+            date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+            textbox.insert("end", f"- [{date_str}] {fact}\n")
+            fact_entry.delete(0, "end")
+            textbox.see("end")
+            _set_status("Факт добавлен в редактор. Индексация — по кнопке «💾 Сохранить и переиндексировать».")
+
+        def open_memory_folder():
+            try:
+                os.makedirs(memory_dir, exist_ok=True)
+                os.startfile(memory_dir)
+            except Exception as e:
+                _set_status(f"Не удалось открыть папку Memory: {e}", "#e06c75")
+
+        def do_save():
+            editor_text = textbox.get("1.0", "end-1c")
+            state["confirm"] = None
+            # Guard 0: в редакторе не осталось ни одного непробельного символа — файл станет полностью пустым
+            if not editor_text.strip() and not state.get("confirmed_empty", False):
+                state["confirmed_empty"] = True
+                _set_status("Память станет полностью пустой. Нажмите «💾 Сохранить и переиндексировать» "
+                            "ещё раз, чтобы подтвердить осознанную очистку.", "#e5c07b")
+                return
+            # Guard 1: файл изменился с момента загрузки (агент/Секретарь дописал факт)
+            try:
+                current_mtime = os.path.getmtime(memory_file) if os.path.exists(memory_file) else None
+            except Exception:
+                current_mtime = None
+            if current_mtime != state["mtime"] and not state.get("confirmed_mtime", False):
+                state["confirmed_mtime"] = True
+                _set_status("Файл памяти изменён агентом с момента открытия — повторное нажатие перезапишет "
+                            "ваши правки поверх новых фактов агента.", "#e5c07b")
+                return
+            # сброс подтверждающих флагов после прохождения гвардов
+            state["confirmed_empty"] = False
+            state["confirmed_mtime"] = False
+            # Страховочная копия текущего файла + ротация (хранить 10)
+            try:
+                if os.path.exists(memory_file):
+                    backup_dir = os.path.join(get_base_path(), ".cache", "agent_memory_backup")
+                    os.makedirs(backup_dir, exist_ok=True)
+                    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                    shutil.copy2(memory_file, os.path.join(backup_dir, f"agent_memory_{ts}.md"))
+                    backups = sorted(
+                        os.path.join(backup_dir, n) for n in os.listdir(backup_dir)
+                        if n.startswith("agent_memory_") and n.endswith(".md")
+                    )
+                    for old in backups[:-10]:
+                        try:
+                            os.remove(old)
+                        except Exception:
+                            pass
+            except Exception as e:
+                # Копия не критична для самой записи — идём дальше с предупреждением
+                log_ui.warning("Управление памятью: не удалось сделать страховочную копию: %s", e)
+            # Атомарная запись: временный файл рядом + os.replace
+            try:
+                os.makedirs(memory_dir, exist_ok=True)
+                tmp_path = memory_file + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(editor_text)
+                os.replace(tmp_path, memory_file)
+            except Exception as e:
+                log_ui.error("Управление памятью: ошибка записи файла памяти: %s", e)
+                _set_status(f"Ошибка записи файла памяти: {e}", "#e06c75")
+                return
+            try:
+                state["mtime"] = os.path.getmtime(memory_file)
+            except Exception:
+                state["mtime"] = None
+            state["snapshot"] = editor_text
+            log_ui.info("Управление памятью: файл памяти записан атомарно (os.replace), снапшот обновлён")
+            # Переиндексация: при живом синке пропускаем (индекс догонит сам по mtime файла)
+            if _sync_in_flight():
+                _set_status("Файл сохранён; переиндексация выполнится при ближайшей синхронизации "
+                            "автоматически (файл изменён).", "#8ab4f8")
+                return
+            save_btn.configure(state="disabled")
+            _set_status("Переиндексация памяти...")
+            threading.Thread(target=_do_reindex, daemon=True).start()
+
+        def _do_reindex():
+            color = "#98c379"
+            try:
+                # Повторная проверка: синк мог взлететь между гвардом и потоком (copytree vs открытые хэндлы)
+                if _sync_in_flight():
+                    msg = "Файл сохранён; переиндексация выполнится при ближайшей синхронизации автоматически (файл изменён)."
+                    color = "#8ab4f8"
+                else:
+                    msg = reindex_memory_file(memory_file)
+            except Exception as e:
+                msg = f"Ошибка переиндексации памяти: {e}"
+                color = "#e06c75"
+                log_ui.error("Управление памятью: %s", msg)
+
+            def _finish():
+                try:
+                    save_btn.configure(state="normal")
+                except Exception:
+                    pass
+                _set_status(msg, color)
+            self.after(0, _finish)
+
+        save_btn = ctk.CTkButton(toolbar, text="💾 Сохранить и переиндексировать", command=do_save,
+                                 fg_color="#2E7D32", hover_color="#1B5E20")
+        save_btn.pack(side="left", padx=(0, 8))
+
+        reload_btn = ctk.CTkButton(toolbar, text="🔄 Перезагрузить", command=reload_from_file)
+        reload_btn.pack(side="left", padx=(0, 8))
+
+        folder_btn = ctk.CTkButton(toolbar, text="📂 Открыть папку Memory", command=open_memory_folder)
+        folder_btn.pack(side="right")
+
+        fact_label = ctk.CTkLabel(toolbar2, text="Новый факт:")
+        fact_label.pack(side="left", padx=(0, 6))
+
+        fact_entry = ctk.CTkEntry(toolbar2, placeholder_text="Текст нового факта...")
+        fact_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        def _add_on_enter(event=None):
+            add_fact()
+            return "break"
+        fact_entry.bind("<Return>", _add_on_enter)
+
+        add_btn = ctk.CTkButton(toolbar2, text="➕ Добавить", command=add_fact, width=110)
+        add_btn.pack(side="left")
+
+        def _on_close():
+            self._memory_window = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        reload_from_file(initial=True)
 
     # ==================== ПРОСМОТРЩИК ЛОГОВ ====================
     def open_log_viewer(self):
