@@ -6626,10 +6626,14 @@ def save_global_settings(data):
 # ==================== GUI ПРИЛОЖЕНИЕ ====================
 
 APP_NAME = "ИИ-Агент СМК"
-APP_VERSION = "v2.5.0 Enterprise"
+APP_VERSION = "v2.5.1 Enterprise"
 APP_DEVELOPER = "Плаксунов В.Б."
 APP_PHONE = "2166"
 APP_DESCRIPTION = (
+    "2.5.1 - Вкладка XWiki: ползунки \"Глубина паучьей догрузки\" и \"Лимит Vision-картинок "
+    "docx\" расположены рядом двумя блоками (было друг над другом); постоянные серые абзацы "
+    "пояснений убраны — теперь пояснение всплывает при наведении на заголовок со значком \"i\" "
+    "или на сам ползунок.\n"
     "2.5.0 - Vision-распознавание картинок, встроенных в docx: схемы и блок-схемы из Word "
     "попадают в базу знаний и чат; лимит картинок на файл за проход (ползунок на вкладке "
     "XWiki, 0 = выключено), кэш распознавания, общий бюджет 60 вызовов/10 минут, защита "
@@ -6637,10 +6641,6 @@ APP_DESCRIPTION = (
     "2.4.2 - Кнопка \"Управление памятью\" (админ): визуальное редактирование Memory/agent_memory.md "
     "с мгновенной переиндексацией, добавление фактов с автодатой, страховочные копии; общая "
     "переиндексация вынесена в reindex_memory_file (инструменты памяти переведены на хелпер).\n"
-    "2.4.1 - Дельта-выгрузка базы на сервер: robocopy /MIR в постоянную папку .staging "
-    "(переносится только изменившееся, \"призраки\" purge'ятся), живой снапшот graph_rag.db "
-    "инъекцией целиком, атомарная замена с переиспользованием старой выгрузки как базы "
-    "следующей дельты; самовосстановление при откате времени или битом staging.\n"
     "Полная история изменений: docs/DECISIONS.md.\n"
     "\n"
     "Корпоративный ИИ-ассистент для Системы Менеджмента Качества (СМК).\n"
@@ -6799,6 +6799,64 @@ def install_cyrillic_shortcuts(root):
     root.bind_all("<Control-KeyPress>", _dispatch, add="+")
     root.bind_all("<Control-KeyRelease>", lambda e: _dispatch(e, is_release=True), add="+")
     log_core.info("Кириллические биндинги Ctrl+C/X/V/A установлены (маршрут по event.char/keycode)")
+
+
+def _hover_tip(widget, text):
+    """Всплывающая подсказка при наведении курсора: показ через 600 мс, скрытие при уходе/клике."""
+    state = {"after": None, "tip": None}
+
+    def _cancel_scheduled():
+        if state["after"] is not None:
+            try:
+                widget.after_cancel(state["after"])
+            except Exception:
+                pass
+            state["after"] = None
+
+    def _hide(_=None):
+        _cancel_scheduled()
+        if state["tip"] is not None:
+            try:
+                state["tip"].destroy()
+            except Exception:
+                pass
+            state["tip"] = None
+
+    def _show():
+        state["after"] = None
+        _hide()
+        try:
+            top = widget.winfo_toplevel()
+            tip = tk.Toplevel(top)  # обычная безрамочная обёртка — CTkToplevel мерцает с overrideredirect
+            tip.wm_overrideredirect(True)
+            try:
+                tip.attributes("-topmost", True)
+            except Exception:
+                pass
+            ctk.CTkLabel(tip, text=text, wraplength=320, justify="left",
+                         fg_color=("gray95", "gray16"), corner_radius=6).pack(padx=1, pady=1)
+            tip.update_idletasks()
+            px, py = widget.winfo_pointerx(), widget.winfo_pointery()
+            w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
+            x = max(0, min(px + 12, widget.winfo_screenwidth() - w - 8))
+            y = max(0, min(py + 16, widget.winfo_screenheight() - h - 8))
+            tip.wm_geometry(f"+{x}+{y}")
+            state["tip"] = tip
+        except Exception:
+            _hide()
+
+    def _enter(_=None):
+        _cancel_scheduled()
+        try:
+            alive = widget.winfo_exists()
+        except Exception:
+            alive = False
+        if alive:
+            state["after"] = widget.after(600, _show)
+
+    widget.bind("<Enter>", _enter, add="+")
+    widget.bind("<Leave>", _hide, add="+")
+    widget.bind("<ButtonPress>", _hide, add="+")
 
 
 class App(ctk.CTk):
@@ -10582,40 +10640,50 @@ class App(ctk.CTk):
         xwiki_urls_scroll.pack(pady=5, fill="both", expand=True)
         render_xwiki_urls()
 
-        # --- П.Е (v2.3.1): ползунок глубины паучьей догрузки (АДМИН; шкала сдвинута 2026-10-31) ---
-        ctk.CTkLabel(tab_xwiki, text="Глубина паучьей догрузки паука (0–5):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0), anchor="w", padx=30)
-        ctk.CTkLabel(tab_xwiki, text="0 — паучья догрузка выключена: индексируются только discovery-цели\n"
-                                     "из списка выше (по умолчанию). 1–5 — паук догружает до N переходов\n"
-                                     "от целей (свою вику тоже ограничивает), кросс-вики — только\n"
-                                     "на вики из списка выше.",
-                     font=ctk.CTkFont(size=12), text_color="gray").pack(pady=(2, 5), anchor="w", padx=30)
-        self.xwiki_spider_depth_var = ctk.DoubleVar(value=float(self.global_settings.get("xwiki_spider_depth", 0)))
-        xwiki_depth_slider = ctk.CTkSlider(tab_xwiki, from_=0, to=5, number_of_steps=5, variable=self.xwiki_spider_depth_var, width=300)
-        xwiki_depth_slider.pack(pady=(5, 0), anchor="w", padx=30)
-
+        # --- П.Е (v2.3.1) глубина паучьей догрузки + v2.5.0 лимит Vision-картинок docx: два столбца (АДМИН; шкала сдвинута 2026-10-31) ---
         def _xwiki_depth_label(v):
             n = int(v)
             if n == 0:
                 return "паучья догрузка выключена (только цели)"
             return f"до {n} перехода" if n == 1 else f"до {n} переходов"
 
-        xwiki_depth_label = ctk.CTkLabel(tab_xwiki, text=_xwiki_depth_label(self.xwiki_spider_depth_var.get()))
-        xwiki_depth_label.pack(pady=(0, 10), anchor="w", padx=30)
+        xwiki_tune_row = ctk.CTkFrame(tab_xwiki, fg_color="transparent")
+        xwiki_tune_row.pack(pady=(5, 10), fill="x", anchor="n")
+        xwiki_tune_left = ctk.CTkFrame(xwiki_tune_row, fg_color="transparent")
+        xwiki_tune_left.pack(side="left", fill="both", expand=True, padx=(30, 5))
+        xwiki_tune_right = ctk.CTkFrame(xwiki_tune_row, fg_color="transparent")
+        xwiki_tune_right.pack(side="left", fill="both", expand=True, padx=(5, 30))
+
+        depth_tip_text = ("0 — паучья догрузка выключена: индексируются только discovery-цели из списка выше (по умолчанию). "
+                          "1–5 — паук догружает до N переходов от целей (свою вику тоже ограничивает), кросс-вики — только на вики из списка выше.")
+        depth_title_row = ctk.CTkFrame(xwiki_tune_left, fg_color="transparent")
+        depth_title_row.pack(fill="x")
+        ctk.CTkLabel(depth_title_row, text="Глубина паучьей догрузки паука (0–5):", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        ctk.CTkLabel(depth_title_row, text="ℹ", width=24, text_color=("gray35", "gray65"), font=ctk.CTkFont(size=13)).pack(side="left", padx=(4, 0))
+        _hover_tip(depth_title_row, depth_tip_text)
+        self.xwiki_spider_depth_var = ctk.DoubleVar(value=float(self.global_settings.get("xwiki_spider_depth", 0)))
+        xwiki_depth_slider = ctk.CTkSlider(xwiki_tune_left, from_=0, to=5, number_of_steps=5, variable=self.xwiki_spider_depth_var, width=260)
+        xwiki_depth_slider.pack(pady=(5, 0), anchor="w")
+        _hover_tip(xwiki_depth_slider, depth_tip_text)
+        xwiki_depth_label = ctk.CTkLabel(xwiki_tune_left, text=_xwiki_depth_label(self.xwiki_spider_depth_var.get()))
+        xwiki_depth_label.pack(anchor="w")
         xwiki_depth_slider.configure(command=lambda v: xwiki_depth_label.configure(text=_xwiki_depth_label(v)))
         if not is_admin:
             xwiki_depth_slider.configure(state="disabled")
 
-        # --- v2.5.0 (Батч D): лимит Vision-картинок docx за проход (АДМИН) ---
-        ctk.CTkLabel(tab_xwiki, text="Лимит Vision-картинок docx за проход (0 = выкл.):", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 0), anchor="w", padx=30)
-        ctk.CTkLabel(tab_xwiki, text="0 — распознавание картинок, встроенных в docx (схемы, блок-схемы), выключено.\n"
-                                     "1–100 — максимум картинок на файл за один проход; недораспознанный\n"
-                                     "остаток добирается повторным чтением/проходом (кэш делает их бесплатными).",
-                     font=ctk.CTkFont(size=12), text_color="gray").pack(pady=(2, 5), anchor="w", padx=30)
+        vision_tip_text = ("0 — распознавание картинок, встроенных в docx (схемы, блок-схемы), выключено. "
+                           "1–100 — максимум картинок на файл за один проход; недораспознанный остаток добирается повторным чтением/проходом (кэш делает их бесплатными).")
+        vision_title_row = ctk.CTkFrame(xwiki_tune_right, fg_color="transparent")
+        vision_title_row.pack(fill="x")
+        ctk.CTkLabel(vision_title_row, text="Лимит Vision-картинок docx за проход (0 = выкл.):", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        ctk.CTkLabel(vision_title_row, text="ℹ", width=24, text_color=("gray35", "gray65"), font=ctk.CTkFont(size=13)).pack(side="left", padx=(4, 0))
+        _hover_tip(vision_title_row, vision_tip_text)
         self.docx_vision_limit_var = ctk.DoubleVar(value=float(self.global_settings.get("docx_vision_max_images_per_file", 30)))
-        docx_vision_limit_slider = ctk.CTkSlider(tab_xwiki, from_=0, to=100, number_of_steps=10, variable=self.docx_vision_limit_var, width=300)
-        docx_vision_limit_slider.pack(pady=(5, 0), anchor="w", padx=30)
-        docx_vision_limit_label = ctk.CTkLabel(tab_xwiki, text=str(int(self.docx_vision_limit_var.get())))
-        docx_vision_limit_label.pack(pady=(0, 10), anchor="w", padx=30)
+        docx_vision_limit_slider = ctk.CTkSlider(xwiki_tune_right, from_=0, to=100, number_of_steps=10, variable=self.docx_vision_limit_var, width=260)
+        docx_vision_limit_slider.pack(pady=(5, 0), anchor="w")
+        _hover_tip(docx_vision_limit_slider, vision_tip_text)
+        docx_vision_limit_label = ctk.CTkLabel(xwiki_tune_right, text=str(int(self.docx_vision_limit_var.get())))
+        docx_vision_limit_label.pack(anchor="w")
         docx_vision_limit_slider.configure(command=lambda v: docx_vision_limit_label.configure(text=str(int(v))))
         if not is_admin:
             docx_vision_limit_slider.configure(state="disabled")
